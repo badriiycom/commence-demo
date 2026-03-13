@@ -212,7 +212,7 @@ if "selected_patient" not in st.session_state:
 
 # ── Pipeline header ───────────────────────────────────────────────
 st.markdown("### SC/SA RUR Pipeline")
-stages = ["EHR Extract","SC Eligibility","AI Classify","Human Review","Authorize & Bill","Outcome Report"]
+stages = ["EHR Extract","SC Eligibility","SC Matching","Human Review","Authorize & Bill","Outcome Report"]
 stage_colors = ["#7256F6","#22C55E","#51B3FA","#F59E0B","#9FE9F2","#E0F972"]
 cols = st.columns(len(stages))
 for i, (stage, color) in enumerate(zip(stages, stage_colors)):
