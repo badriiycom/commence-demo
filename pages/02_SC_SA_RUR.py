@@ -283,14 +283,14 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📊 AI Classification")
     st.markdown("""
-    **Model:** CFR 38 ICD-10 Matcher v3.0  
-    **SC Families:** 23 conditions  
-    **ICD-10 Rules:** 200+ prefix mappings  
-    **PACT Act:** 2022 expansion included  
-    **Accuracy:** 97.1% vs VHA baseline  
-    **Human Review:** Required before authorize  
-    **FISMA Audit:** ✅ Full trail logged  
-    """)
+    **Approach:** CFR 38 VASRD ICD-10 prefix matching  
+    **SC Categories:** 23 conditions across 8 clinical domains  
+    **Domains:** Musculoskeletal · Mental Health · Neurological · Cardiovascular · Respiratory · Sensory · Endocrine · TBI  
+    **PACT Act:** 9 presumptive condition families · Pub.L. 117-168  
+    **Matching:** Rule-based prefix logic — not validated against VA outcomes  
+    **Human Review:** Required before every authorization  
+    **Audit Trail:** Logged per determination  
+    """)    
     st.markdown("---")
     st.markdown("### 🔗 Data Sources")
     st.markdown(f"""
