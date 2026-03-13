@@ -188,7 +188,7 @@ with col2:
 with st.spinner("Connecting to FHIR server..."):
     patient_data, fhir_status = fetch_patients_with_conditions(16)
 
-if fhir_status == "live" and patient_data:
+if False and fhir_status == "live" and patient_data:
     st.success(f"✅ **FHIR R4 Live** — {len(patient_data)} veteran patients loaded · Conditions fetched · CFR 38 VASRD matching active")
 else:
     st.info("📦 **Offline Mode** — Representative VA veteran population loaded · CFR 38 SC matching active")
