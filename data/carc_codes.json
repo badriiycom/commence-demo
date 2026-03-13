@@ -1,0 +1,142 @@
+[
+  {
+    "code": "4",
+    "description": "Service not covered",
+    "category": "Coverage",
+    "denial_rate": 0.31,
+    "avg_amount": 1200
+  },
+  {
+    "code": "5",
+    "description": "Procedure code inconsistent with place of service",
+    "category": "Coding",
+    "denial_rate": 0.18,
+    "avg_amount": 890
+  },
+  {
+    "code": "11",
+    "description": "Diagnosis inconsistent with procedure",
+    "category": "Coding",
+    "denial_rate": 0.22,
+    "avg_amount": 760
+  },
+  {
+    "code": "16",
+    "description": "Claim lacks information or has billing error",
+    "category": "Administrative",
+    "denial_rate": 0.28,
+    "avg_amount": 520
+  },
+  {
+    "code": "22",
+    "description": "COB - may be covered by another payer",
+    "category": "COB",
+    "denial_rate": 0.19,
+    "avg_amount": 2100
+  },
+  {
+    "code": "45",
+    "description": "Charge exceeds fee schedule/maximum allowable",
+    "category": "Contractual",
+    "denial_rate": 0.35,
+    "avg_amount": 3400
+  },
+  {
+    "code": "50",
+    "description": "Non-covered - not deemed medical necessity",
+    "category": "Medical Necessity",
+    "denial_rate": 0.42,
+    "avg_amount": 4200
+  },
+  {
+    "code": "96",
+    "description": "Non-covered charge(s)",
+    "category": "Coverage",
+    "denial_rate": 0.38,
+    "avg_amount": 2800
+  },
+  {
+    "code": "97",
+    "description": "Benefit included in another service payment",
+    "category": "Bundling",
+    "denial_rate": 0.17,
+    "avg_amount": 450
+  },
+  {
+    "code": "109",
+    "description": "Claim not covered by this payer",
+    "category": "Coverage",
+    "denial_rate": 0.29,
+    "avg_amount": 1500
+  },
+  {
+    "code": "167",
+    "description": "Diagnosis not covered",
+    "category": "Coverage",
+    "denial_rate": 0.24,
+    "avg_amount": 980
+  },
+  {
+    "code": "177",
+    "description": "Patient has not met eligibility requirements",
+    "category": "Eligibility",
+    "denial_rate": 0.21,
+    "avg_amount": 1100
+  },
+  {
+    "code": "197",
+    "description": "Precertification/authorization absent",
+    "category": "Auth",
+    "denial_rate": 0.44,
+    "avg_amount": 5600
+  },
+  {
+    "code": "236",
+    "description": "Procedure/modifier combination incompatible",
+    "category": "Coding",
+    "denial_rate": 0.19,
+    "avg_amount": 670
+  },
+  {
+    "code": "18",
+    "description": "Duplicate claim/service",
+    "category": "Administrative",
+    "denial_rate": 0.15,
+    "avg_amount": 0
+  },
+  {
+    "code": "29",
+    "description": "Time limit for filing has expired",
+    "category": "Administrative",
+    "denial_rate": 0.14,
+    "avg_amount": 0
+  },
+  {
+    "code": "51",
+    "description": "Pre-existing condition",
+    "category": "Coverage",
+    "denial_rate": 0.23,
+    "avg_amount": 1800
+  },
+  {
+    "code": "119",
+    "description": "Benefit maximum reached",
+    "category": "Coverage",
+    "denial_rate": 0.16,
+    "avg_amount": 2200
+  },
+  {
+    "code": "170",
+    "description": "Payment denied for this provider type",
+    "category": "Provider",
+    "denial_rate": 0.13,
+    "avg_amount": 760
+  },
+  {
+    "code": "200",
+    "description": "Expenses during lapse in coverage",
+    "category": "Coverage",
+    "denial_rate": 0.09,
+    "avg_amount": 890
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "icd10_prefix": "C34",
+    "condition": "Lung Cancer",
+    "notes": "Burn pit presumptive \u2014 PACT Act 2022"
+  },
+  {
+    "icd10_prefix": "C18",
+    "condition": "Colorectal Cancer",
+    "notes": "Agent Orange presumptive"
+  },
+  {
+    "icd10_prefix": "C61",
+    "condition": "Prostate Cancer",
+    "notes": "Agent Orange presumptive"
+  },
+  {
+    "icd10_prefix": "C92",
+    "condition": "Leukemia",
+    "notes": "Radiation/toxic exposure presumptive"
+  },
+  {
+    "icd10_prefix": "J68",
+    "condition": "Toxic Inhalation Injury",
+    "notes": "Burn pit presumptive \u2014 PACT Act 2022"
+  },
+  {
+    "icd10_prefix": "J70",
+    "condition": "Respiratory from External Agents",
+    "notes": "Burn pit presumptive \u2014 PACT Act 2022"
+  },
+  {
+    "icd10_prefix": "K92",
+    "condition": "GI Conditions",
+    "notes": "Gulf War presumptive"
+  },
+  {
+    "icd10_prefix": "G89",
+    "condition": "Chronic Pain Syndrome",
+    "notes": "Gulf War presumptive"
+  },
+  {
+    "icd10_prefix": "R53",
+    "condition": "Chronic Fatigue",
+    "notes": "Gulf War presumptive"
+  }
+]

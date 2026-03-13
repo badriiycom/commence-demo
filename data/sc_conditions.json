@@ -1,0 +1,291 @@
+[
+  {
+    "icd10_prefix": "F43",
+    "condition": "PTSD",
+    "cfr_ref": "38 CFR 4.130 DC 9411",
+    "rating_pcts": [
+      10,
+      30,
+      50,
+      70,
+      100
+    ],
+    "revenue_est": 8400,
+    "category": "Mental Health"
+  },
+  {
+    "icd10_prefix": "F32",
+    "condition": "Major Depressive Disorder",
+    "cfr_ref": "38 CFR 4.130 DC 9434",
+    "rating_pcts": [
+      10,
+      30,
+      50,
+      70,
+      100
+    ],
+    "revenue_est": 6200,
+    "category": "Mental Health"
+  },
+  {
+    "icd10_prefix": "F41",
+    "condition": "Anxiety Disorder",
+    "cfr_ref": "38 CFR 4.130 DC 9400",
+    "rating_pcts": [
+      10,
+      30,
+      50
+    ],
+    "revenue_est": 4800,
+    "category": "Mental Health"
+  },
+  {
+    "icd10_prefix": "F40",
+    "condition": "Phobia/Social Anxiety",
+    "cfr_ref": "38 CFR 4.130 DC 9403",
+    "rating_pcts": [
+      10,
+      30
+    ],
+    "revenue_est": 3200,
+    "category": "Mental Health"
+  },
+  {
+    "icd10_prefix": "M54",
+    "condition": "Lumbosacral Strain",
+    "cfr_ref": "38 CFR 4.71a DC 5237",
+    "rating_pcts": [
+      10,
+      20,
+      40
+    ],
+    "revenue_est": 5600,
+    "category": "Musculoskeletal"
+  },
+  {
+    "icd10_prefix": "M17",
+    "condition": "Knee Osteoarthritis",
+    "cfr_ref": "38 CFR 4.71a DC 5257",
+    "rating_pcts": [
+      10,
+      20,
+      30
+    ],
+    "revenue_est": 4900,
+    "category": "Musculoskeletal"
+  },
+  {
+    "icd10_prefix": "M75",
+    "condition": "Shoulder Condition",
+    "cfr_ref": "38 CFR 4.71a DC 5201",
+    "rating_pcts": [
+      10,
+      20,
+      30,
+      40
+    ],
+    "revenue_est": 5100,
+    "category": "Musculoskeletal"
+  },
+  {
+    "icd10_prefix": "M79",
+    "condition": "Fibromyalgia",
+    "cfr_ref": "38 CFR 4.71a DC 5025",
+    "rating_pcts": [
+      10,
+      20,
+      40
+    ],
+    "revenue_est": 4200,
+    "category": "Musculoskeletal"
+  },
+  {
+    "icd10_prefix": "G43",
+    "condition": "Migraine",
+    "cfr_ref": "38 CFR 4.124a DC 8100",
+    "rating_pcts": [
+      0,
+      10,
+      30,
+      50
+    ],
+    "revenue_est": 4100,
+    "category": "Neurological"
+  },
+  {
+    "icd10_prefix": "G54",
+    "condition": "Radiculopathy",
+    "cfr_ref": "38 CFR 4.124a DC 8520",
+    "rating_pcts": [
+      10,
+      20,
+      40
+    ],
+    "revenue_est": 4600,
+    "category": "Neurological"
+  },
+  {
+    "icd10_prefix": "I10",
+    "condition": "Hypertension",
+    "cfr_ref": "38 CFR 4.104 DC 7101",
+    "rating_pcts": [
+      10,
+      20,
+      40,
+      60
+    ],
+    "revenue_est": 3600,
+    "category": "Cardiovascular"
+  },
+  {
+    "icd10_prefix": "I25",
+    "condition": "Ischemic Heart Disease",
+    "cfr_ref": "38 CFR 4.104 DC 7005",
+    "rating_pcts": [
+      10,
+      30,
+      60,
+      100
+    ],
+    "revenue_est": 9800,
+    "category": "Cardiovascular"
+  },
+  {
+    "icd10_prefix": "I50",
+    "condition": "Heart Failure",
+    "cfr_ref": "38 CFR 4.104 DC 7007",
+    "rating_pcts": [
+      30,
+      60,
+      100
+    ],
+    "revenue_est": 14200,
+    "category": "Cardiovascular"
+  },
+  {
+    "icd10_prefix": "J45",
+    "condition": "Asthma",
+    "cfr_ref": "38 CFR 4.97 DC 6602",
+    "rating_pcts": [
+      10,
+      30,
+      60
+    ],
+    "revenue_est": 4400,
+    "category": "Respiratory"
+  },
+  {
+    "icd10_prefix": "J44",
+    "condition": "COPD",
+    "cfr_ref": "38 CFR 4.97 DC 6604",
+    "rating_pcts": [
+      10,
+      30,
+      60,
+      100
+    ],
+    "revenue_est": 7800,
+    "category": "Respiratory"
+  },
+  {
+    "icd10_prefix": "H91",
+    "condition": "Hearing Loss",
+    "cfr_ref": "38 CFR 4.85 DC 6100",
+    "rating_pcts": [
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "revenue_est": 2800,
+    "category": "Sensory"
+  },
+  {
+    "icd10_prefix": "H83",
+    "condition": "Tinnitus",
+    "cfr_ref": "38 CFR 4.87 DC 6260",
+    "rating_pcts": [
+      10
+    ],
+    "revenue_est": 1800,
+    "category": "Sensory"
+  },
+  {
+    "icd10_prefix": "E10",
+    "condition": "Type 1 Diabetes",
+    "cfr_ref": "38 CFR 4.119 DC 7913",
+    "rating_pcts": [
+      10,
+      20,
+      40,
+      60,
+      100
+    ],
+    "revenue_est": 6800,
+    "category": "Endocrine"
+  },
+  {
+    "icd10_prefix": "E11",
+    "condition": "Type 2 Diabetes",
+    "cfr_ref": "38 CFR 4.119 DC 7913",
+    "rating_pcts": [
+      10,
+      20,
+      40
+    ],
+    "revenue_est": 5200,
+    "category": "Endocrine"
+  },
+  {
+    "icd10_prefix": "S09",
+    "condition": "TBI",
+    "cfr_ref": "38 CFR 4.124a DC 8045",
+    "rating_pcts": [
+      10,
+      40,
+      70,
+      100
+    ],
+    "revenue_est": 11400,
+    "category": "TBI"
+  },
+  {
+    "icd10_prefix": "S06",
+    "condition": "Intracranial Injury",
+    "cfr_ref": "38 CFR 4.124a DC 8045",
+    "rating_pcts": [
+      10,
+      40,
+      70,
+      100
+    ],
+    "revenue_est": 10800,
+    "category": "TBI"
+  },
+  {
+    "icd10_prefix": "G35",
+    "condition": "Multiple Sclerosis",
+    "cfr_ref": "38 CFR 4.124a DC 8018",
+    "rating_pcts": [
+      30,
+      50,
+      70,
+      100
+    ],
+    "revenue_est": 12000,
+    "category": "Neurological"
+  },
+  {
+    "icd10_prefix": "M47",
+    "condition": "Cervical Spondylosis",
+    "cfr_ref": "38 CFR 4.71a DC 5242",
+    "rating_pcts": [
+      10,
+      20,
+      30
+    ],
+    "revenue_est": 3800,
+    "category": "Musculoskeletal"
+  }
+]
