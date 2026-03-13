@@ -296,18 +296,15 @@ with st.sidebar:
     service_options = ["All"] + sorted(list(set(c["service"] for c in claims)))
     service_filter = st.selectbox("Service Line", service_options)
 
-    st.markdown("---")
-    st.markdown("### 📊 Model Card")
     st.markdown("""
-    **Model:** CARC/RARC Denial Predictor v2.1  
-    **Training Data:** CMS Medicare claims (2020–2023)  
-    **Precision:** 87.3% | **Recall:** 91.2%  
-    **Last Bias Audit:** Jan 2025  
-    **Demographic Parity:** ✅ Passed  
-    **Human Review:** Required ≥70 score  
-    **Documentation:** FISMA compliant  
+    **Approach:** Rule-based CARC/RARC weighted scoring  
+    **Signal Source:** CMS public denial code rates  
+    **Scoring:** Illustrative — not a trained ML model  
+    **Human Review:** Required for all scores ≥70  
+    **Audit Trail:** Logged per action  
+    **Note:** Production model requires training on VA claims data  
     """)
-
+    
     st.markdown("---")
     st.markdown("### 🔗 Architecture")
     st.markdown(f"""
