@@ -71,7 +71,6 @@ SNOMED_TO_ICD10 = {
     "414545008": {"code": "I25.10", "display": "Ischemic heart disease"},
     "84114007":  {"code": "I50.9",  "display": "Heart failure"},
     "44054006":  {"code": "I25.10", "display": "Coronary artery disease"},
-    "230690007": {"code": "I25.10", "display": "Cerebrovascular disease"},
     # Respiratory
     "13645005":  {"code": "J44.9",  "display": "COPD"},
     "195967001": {"code": "J45.40", "display": "Asthma"},
@@ -92,7 +91,6 @@ SNOMED_TO_ICD10 = {
     "60862001":  {"code": "H83.09", "display": "Tinnitus"},
     "309385003": {"code": "H91.90", "display": "Hearing loss"},
     # Endocrine
-    "44054006":  {"code": "E11.9",  "display": "Type 2 diabetes"},
     "73211009":  {"code": "E11.9",  "display": "Diabetes mellitus"},
     "46635009":  {"code": "E10.9",  "display": "Type 1 diabetes"},
     "190330002": {"code": "E11.9",  "display": "Diabetes type 2"},
@@ -103,6 +101,64 @@ SNOMED_TO_ICD10 = {
     "230690007": {"code": "S09.90", "display": "Brain injury"},
 }
 
+# ── MCCF billing authority determination ─────────────────────────
+def determine_billing_authority(matches, has_pact):
+    """
+    Determine MCCF vs Non-MCCF billing authority based on
+    SC condition matches and PACT Act status.
+
+    MCCF (38 USC 1729):
+      Standard third-party OHI billing for non-SC conditions.
+      Veteran copayment may apply.
+
+    Non-MCCF (38 USC 1722A / PACT Act PL 117-168):
+      SC-confirmed or PACT Act presumptive conditions.
+      Veteran exempt from copayment.
+      Third-party recovery still applicable.
+    """
+    has_sc_match  = len(matches) > 0
+    has_pact_match = has_pact
+
+    if has_pact_match:
+        return {
+            "status":           "NON-MCCF",
+            "authority":        "38 USC 1722A / PACT Act PL 117-168",
+            "veteran_liability": False,
+            "copayment":        "$0 — exempt from copayment",
+            "third_party":      "Applicable — bill OHI payers",
+            "human_review":     True,
+            "review_reason":    "PACT Act presumptive — SC verification required",
+            "action":           "Route to OHI billing queue pending SC verification",
+            "color":            "#FF5C6B",
+            "badge":            "NON-MCCF · PACT Act",
+        }
+    elif has_sc_match:
+        return {
+            "status":           "NON-MCCF",
+            "authority":        "38 USC 1722A",
+            "veteran_liability": False,
+            "copayment":        "$0 — SC condition exempt",
+            "third_party":      "Applicable — bill OHI payers",
+            "human_review":     True,
+            "review_reason":    "SC determination requires human authorization",
+            "action":           "Route to OHI billing queue upon authorization",
+            "color":            "#F59E0B",
+            "badge":            "NON-MCCF · SC Confirmed",
+        }
+    else:
+        return {
+            "status":           "MCCF",
+            "authority":        "38 USC 1729",
+            "veteran_liability": True,
+            "copayment":        "Standard copayment may apply",
+            "third_party":      "Standard OHI billing",
+            "human_review":     False,
+            "review_reason":    "",
+            "action":           "Process through standard MCCF billing workflow",
+            "color":            "#22C55E",
+            "badge":            "MCCF · Standard Billing",
+        }
+
 # ── FHIR fetch ────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_patients_with_conditions(count=16):
@@ -110,7 +166,7 @@ def fetch_patients_with_conditions(count=16):
     try:
         r = requests.get(
             f"{FHIR_BASE}/Patient",
-            params={"_count": count, "_format": "json"},
+            params={"_count": count, "_sort": "-_lastUpdated", "_format": "json"},
             timeout=8
         )
         if r.status_code != 200:
@@ -135,23 +191,20 @@ def fetch_patients_with_conditions(count=16):
                         res = ce.get("resource", {})
                         code_obj = res.get("code", {})
                         for coding in code_obj.get("coding", []):
-                            system = coding.get("system", "")
-                            code   = coding.get("code", "")
+                            system  = coding.get("system", "")
+                            code    = coding.get("code", "")
                             display = coding.get("display", code_obj.get("text", "Unknown"))
 
                             # Accept ICD-10 directly
                             if system.startswith("http://hl7.org/fhir/sid/icd"):
-                                conds.append({
-                                    "code": code,
-                                    "display": display
-                                })
+                                conds.append({"code": code, "display": display})
 
                             # Map SNOMED to ICD-10 equivalent
                             elif system.startswith("http://snomed.info/sct"):
                                 mapped = SNOMED_TO_ICD10.get(code)
                                 if mapped:
                                     conds.append({
-                                        "code": mapped["code"],
+                                        "code":    mapped["code"],
                                         "display": mapped["display"]
                                     })
 
@@ -172,7 +225,7 @@ def match_sc_conditions(icd10_codes):
     matches = []
     seen = set()
     for code_obj in icd10_codes:
-        code = code_obj.get("code", "")
+        code    = code_obj.get("code", "")
         display = code_obj.get("display", "")
         prefix3 = code[:3]
         prefix2 = code[:2]
@@ -182,13 +235,13 @@ def match_sc_conditions(icd10_codes):
                 sc = SC_CONDITIONS[prefix]
                 seen.add(prefix)
 
-                base = 0.88 if len(prefix) == 3 else 0.72
-                h = sum(ord(c) for c in code)
-                jitter = ((h % 15) - 7) / 100
+                base       = 0.88 if len(prefix) == 3 else 0.72
+                h          = sum(ord(c) for c in code)
+                jitter     = ((h % 15) - 7) / 100
                 confidence = min(0.97, max(0.45, base + jitter))
 
                 rating_pcts = sc["rating_pcts"]
-                max_rating = max(rating_pcts)
+                max_rating  = max(rating_pcts)
                 est_revenue = int(sc["revenue_est"] * confidence)
 
                 pact_match = None
@@ -198,16 +251,16 @@ def match_sc_conditions(icd10_codes):
                         break
 
                 matches.append({
-                    "icd10":        code,
+                    "icd10":         code,
                     "icd10_display": display or sc["condition"],
-                    "sc_condition": sc["condition"],
-                    "cfr_ref":      sc["cfr_ref"],
-                    "confidence":   confidence,
-                    "max_rating":   max_rating,
-                    "rating_pcts":  rating_pcts,
-                    "revenue_est":  est_revenue,
-                    "category":     sc["category"],
-                    "pact":         pact_match
+                    "sc_condition":  sc["condition"],
+                    "cfr_ref":       sc["cfr_ref"],
+                    "confidence":    confidence,
+                    "max_rating":    max_rating,
+                    "rating_pcts":   rating_pcts,
+                    "revenue_est":   est_revenue,
+                    "category":      sc["category"],
+                    "pact":          pact_match
                 })
     return sorted(matches, key=lambda x: -x["confidence"])
 
@@ -245,10 +298,10 @@ def synthetic_patients():
         dob = datetime.date(1960 + (i*3)%30, (i%12)+1, (i*7%28)+1)
         conditions = scenarios[i % len(scenarios)]
         pat = {
-            "id": f"SYN-{1000+i}",
-            "name": [{"given":[fname],"family":lname}],
+            "id":        f"SYN-{1000+i}",
+            "name":      [{"given":[fname],"family":lname}],
             "birthDate": dob.isoformat(),
-            "gender": "male" if i%3!=1 else "female"
+            "gender":    "male" if i%3!=1 else "female"
         }
         result.append({"patient":pat, "conditions":conditions})
     random.seed()
@@ -258,13 +311,14 @@ def synthetic_patients():
 st.markdown("""
 <style>
     .main { background: #F0FFF8; }
-    .badge-high { background:#22C55E22; color:#15803D; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .badge-med  { background:#F59E0B22; color:#B45309; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .badge-low  { background:#7256F622; color:#4F35C2; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .pact-badge { background:#FF5C6B22; color:#CC1122; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:bold; }
-    .cfr-tag    { background:#E0F4FF; color:#0369A1; padding:2px 8px; border-radius:4px; font-size:11px; font-family:monospace; }
+    .badge-high  { background:#22C55E22; color:#15803D; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
+    .badge-med   { background:#F59E0B22; color:#B45309; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
+    .badge-low   { background:#7256F622; color:#4F35C2; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:bold; }
+    .pact-badge  { background:#FF5C6B22; color:#CC1122; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:bold; }
+    .cfr-tag     { background:#E0F4FF; color:#0369A1; padding:2px 8px; border-radius:4px; font-size:11px; font-family:monospace; }
     .audit-entry { background:#F0FFF8; border-radius:6px; padding:8px 12px; margin:4px 0; font-size:13px; border-left:3px solid #22C55E; }
     .pipeline-stage { text-align:center; padding:8px; border-radius:6px; font-size:12px; font-weight:bold; }
+    .billing-panel { border-radius:10px; padding:14px 16px; margin:10px 0; }
     h1, h2, h3 { color: #0A2A1A !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -305,7 +359,7 @@ if "selected_patient" not in st.session_state:
 
 # ── Pipeline header ───────────────────────────────────────────────
 st.markdown("### SC/SA RUR Pipeline")
-stages = ["EHR Extract","SC Eligibility","SC Matching","Human Review","Authorize & Bill","Outcome Report"]
+stages       = ["EHR Extract","SC Eligibility","SC Matching","Human Review","Authorize & Bill","Outcome Report"]
 stage_colors = ["#7256F6","#22C55E","#51B3FA","#F59E0B","#9FE9F2","#E0F972"]
 cols = st.columns(len(stages))
 for i, (stage, color) in enumerate(zip(stages, stage_colors)):
@@ -327,38 +381,38 @@ for pd_entry in patient_data:
     if not matches and conds:
         continue
 
-    pat_id = pat.get("id","")
+    pat_id   = pat.get("id","")
     name_obj = pat.get("name",[{}])[0]
-    fname = name_obj.get("given",["Veteran"])[0]
-    lname = name_obj.get("family","V")
-    dob   = pat.get("birthDate","1970-01-01")
-    gender = pat.get("gender","unknown")
+    fname    = name_obj.get("given",["Veteran"])[0]
+    lname    = name_obj.get("family","V")
+    dob      = pat.get("birthDate","1970-01-01")
+    gender   = pat.get("gender","unknown")
 
     try:
         age = datetime.date.today().year - int(dob[:4])
     except Exception:
         age = 55
 
-    top_match = matches[0] if matches else None
-    total_rev = sum(m["revenue_est"] for m in matches)
-    max_conf  = max((m["confidence"] for m in matches), default=0)
-    has_pact  = any(m["pact"] for m in matches)
-
-    current_stage = st.session_state.patient_stages.get(pat_id, "SC Eligibility")
+    top_match  = matches[0] if matches else None
+    total_rev  = sum(m["revenue_est"] for m in matches)
+    max_conf   = max((m["confidence"] for m in matches), default=0)
+    has_pact   = any(m["pact"] for m in matches)
+    billing    = determine_billing_authority(matches, has_pact)
 
     all_patients.append({
-        "id": pat_id,
-        "name": f"{fname} {lname[0]}.",
-        "age": age,
-        "gender": gender,
-        "dob": dob,
-        "conditions": conds,
-        "matches": matches,
-        "top_match": top_match,
+        "id":            pat_id,
+        "name":          f"{fname} {lname[0]}.",
+        "age":           age,
+        "gender":        gender,
+        "dob":           dob,
+        "conditions":    conds,
+        "matches":       matches,
+        "top_match":     top_match,
         "total_revenue": total_rev,
-        "max_confidence": max_conf,
-        "has_pact": has_pact,
-        "stage": current_stage
+        "max_confidence":max_conf,
+        "has_pact":      has_pact,
+        "billing":       billing,
+        "stage":         st.session_state.patient_stages.get(pat_id, "SC Eligibility")
     })
 
 all_patients = sorted(all_patients, key=lambda x: -x["max_confidence"])
@@ -408,10 +462,10 @@ if pact_only:
 
 # ── KPIs ──────────────────────────────────────────────────────────
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Veterans in Pipeline", len(filtered_patients))
-k2.metric("High Confidence SC", sum(1 for p in filtered_patients if p["max_confidence"] >= 0.80))
-k3.metric("PACT Act Cases", sum(1 for p in filtered_patients if p["has_pact"]))
-k4.metric("Est. Revenue Capture", f"${sum(p['total_revenue'] for p in filtered_patients):,.0f}")
+k1.metric("Veterans in Pipeline",  len(filtered_patients))
+k2.metric("High Confidence SC",    sum(1 for p in filtered_patients if p["max_confidence"] >= 0.80))
+k3.metric("PACT Act Cases",        sum(1 for p in filtered_patients if p["has_pact"]))
+k4.metric("Est. Revenue Capture",  f"${sum(p['total_revenue'] for p in filtered_patients):,.0f}")
 
 st.markdown("---")
 
@@ -420,8 +474,8 @@ main_col, detail_col = st.columns([3, 2])
 with main_col:
     st.markdown("### 👥 Veteran SC Classification Queue")
     for pat in filtered_patients:
-        conf = pat["max_confidence"]
-        tier = "high" if conf >= 0.80 else "med" if conf >= 0.50 else "low"
+        conf        = pat["max_confidence"]
+        tier        = "high" if conf >= 0.80 else "med" if conf >= 0.50 else "low"
         badge_label = f"{conf*100:.0f}% SC Match"
 
         with st.container():
@@ -430,7 +484,7 @@ with main_col:
                 st.markdown(f"**{pat['name']}**  \nAge {pat['age']} · {pat['gender'].title()}")
             with c2:
                 if pat["top_match"]:
-                    tm = pat["top_match"]
+                    tm       = pat["top_match"]
                     pact_str = " 🔴PACT" if tm["pact"] else ""
                     st.markdown(f"**{tm['sc_condition']}**{pact_str}  \n`{tm['icd10']}` · {tm['category']}")
                 else:
@@ -439,7 +493,15 @@ with main_col:
                 st.markdown(f"<span class='badge-{tier}'>{badge_label}</span>", unsafe_allow_html=True)
                 st.progress(conf)
             with c4:
-                st.markdown(f"**${pat['total_revenue']:,}**  \nest. revenue")
+                billing = pat["billing"]
+                b_color = "#FF5C6B" if billing["status"] == "NON-MCCF" else "#22C55E"
+                st.markdown(
+                    f"<span style='background:{b_color}22; color:{b_color}; "
+                    f"padding:2px 8px; border-radius:8px; font-size:11px; font-weight:bold;'>"
+                    f"{billing['status']}</span>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(f"**${pat['total_revenue']:,}** est.")
             with c5:
                 stage = st.session_state.patient_stages.get(pat["id"], "SC Eligibility")
                 if stage in ["Authorized","Billed"]:
@@ -454,17 +516,19 @@ with detail_col:
         pat = st.session_state.selected_patient
         st.markdown(f"### 🔍 {pat['name']} — SC Detail")
 
+        # Pipeline progress
         current_stage = st.session_state.patient_stages.get(pat["id"], "SC Eligibility")
-        stage_idx = stages.index(current_stage) if current_stage in stages else 1
-        progress = (stage_idx + 1) / len(stages)
+        stage_idx     = stages.index(current_stage) if current_stage in stages else 1
+        progress      = (stage_idx + 1) / len(stages)
         st.progress(progress)
         st.caption(f"Current stage: **{current_stage}**")
 
+        # SC Condition Matches
         st.markdown("**SC Condition Matches — CFR 38 VASRD**")
         for m in pat["matches"][:4]:
-            conf_pct = int(m["confidence"]*100)
+            conf_pct   = int(m["confidence"]*100)
             conf_color = "#22C55E" if conf_pct >= 80 else "#F59E0B" if conf_pct >= 50 else "#7256F6"
-            pact_html = ""
+            pact_html  = ""
             if m["pact"]:
                 pact_html = f"<br><span class='pact-badge'>🔴 PACT ACT: {m['pact']['notes']}</span>"
 
@@ -489,11 +553,60 @@ with detail_col:
             </div>
             """, unsafe_allow_html=True)
 
+        # ── Billing Authority Determination ───────────────────────
+        st.markdown("---")
+        st.markdown("**⚖️ Billing Authority Determination**")
+
+        billing    = pat["billing"]
+        b_color    = billing["color"]
+        b_status   = billing["status"]
+        b_auth     = billing["authority"]
+        b_copay    = billing["copayment"]
+        b_tp       = billing["third_party"]
+        b_action   = billing["action"]
+        b_review   = billing["human_review"]
+        b_reason   = billing["review_reason"]
+        b_revenue  = pat["total_revenue"]
+
+        st.markdown(f"""
+        <div class='billing-panel' style='background:{b_color}11; border:2px solid {b_color};'>
+            <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>
+                <span style='font-size:18px; font-weight:bold; color:{b_color};'>{b_status}</span>
+                <span style='font-size:12px; color:#444; font-family:monospace;'>{b_auth}</span>
+            </div>
+            <table style='width:100%; font-size:12px; border-collapse:collapse;'>
+                <tr>
+                    <td style='color:#666; padding:3px 0; width:45%;'>Veteran Liability</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{b_copay}</td>
+                </tr>
+                <tr>
+                    <td style='color:#666; padding:3px 0;'>Third-party Recovery</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{b_tp}</td>
+                </tr>
+                <tr>
+                    <td style='color:#666; padding:3px 0;'>Est. Revenue</td>
+                    <td style='font-weight:bold; color:{b_color};'>${b_revenue:,}</td>
+                </tr>
+                <tr>
+                    <td style='color:#666; padding:3px 0;'>Human Review</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{'Required ⚠️' if b_review else 'Not required'}</td>
+                </tr>
+                {f"<tr><td style='color:#666; padding:3px 0;'>Review Reason</td><td style='font-size:11px; color:#666;'>{b_reason}</td></tr>" if b_reason else ""}
+            </table>
+            <div style='margin-top:10px; padding:8px; background:{b_color}22; border-radius:6px;
+                        font-size:12px; color:{b_color}; font-weight:bold;'>
+                → {b_action}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Authorize SC Determination
         st.markdown("---")
         st.markdown("**Authorize SC Determination**")
-        reviewer = st.text_input("VA Staff ID", key="sc_reviewer", placeholder="Enter your VA staff ID")
+        reviewer  = st.text_input("VA Staff ID", key="sc_reviewer",
+                        placeholder="Enter your VA staff ID")
         rationale = st.text_area("Clinical Rationale", height=70, key="sc_notes",
-            placeholder="Confirm SC determination rationale...")
+                        placeholder="Confirm SC determination rationale...")
 
         a1, a2, a3 = st.columns(3)
         with a1:
@@ -501,68 +614,74 @@ with detail_col:
                 if reviewer:
                     st.session_state.patient_stages[pat["id"]] = "Authorized"
                     st.session_state.sc_audit.append({
-                        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "patient": pat["name"],
-                        "action": "AUTHORIZED",
-                        "reviewer": reviewer,
-                        "revenue": pat["total_revenue"],
+                        "ts":         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "patient":    pat["name"],
+                        "action":     "AUTHORIZED",
+                        "reviewer":   reviewer,
+                        "revenue":    pat["total_revenue"],
+                        "billing":    billing["status"],
                         "conditions": len(pat["matches"]),
-                        "notes": rationale or "—"
+                        "notes":      rationale or "—"
                     })
                     st.session_state.selected_patient = None
                     st.rerun()
                 else:
-                    st.error("VA Staff ID required")
+                    st.error("Reviewer ID required")
         with a2:
             if st.button("⏸ Pend", use_container_width=True, key="pend_btn"):
                 if reviewer:
                     st.session_state.patient_stages[pat["id"]] = "Pending Additional Info"
                     st.session_state.sc_audit.append({
-                        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "patient": pat["name"],
-                        "action": "PENDED",
-                        "reviewer": reviewer,
-                        "revenue": pat["total_revenue"],
+                        "ts":         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "patient":    pat["name"],
+                        "action":     "PENDED",
+                        "reviewer":   reviewer,
+                        "revenue":    pat["total_revenue"],
+                        "billing":    billing["status"],
                         "conditions": len(pat["matches"]),
-                        "notes": rationale or "—"
+                        "notes":      rationale or "—"
                     })
                     st.session_state.selected_patient = None
                     st.rerun()
                 else:
-                    st.error("VA Staff ID required")
+                    st.error("Reviewer ID required")
         with a3:
             if st.button("❌ Deny", use_container_width=True, key="deny_btn"):
                 if reviewer:
                     st.session_state.patient_stages[pat["id"]] = "Denied"
                     st.session_state.sc_audit.append({
-                        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "patient": pat["name"],
-                        "action": "DENIED",
-                        "reviewer": reviewer,
-                        "revenue": 0,
+                        "ts":         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "patient":    pat["name"],
+                        "action":     "DENIED",
+                        "reviewer":   reviewer,
+                        "revenue":    0,
+                        "billing":    "N/A",
                         "conditions": len(pat["matches"]),
-                        "notes": rationale or "—"
+                        "notes":      rationale or "—"
                     })
                     st.session_state.selected_patient = None
                     st.rerun()
                 else:
-                    st.error("VA Staff ID required")
+                    st.error("Reviewer ID required")
 
     else:
         st.markdown("### 👆 Select a veteran to review")
         st.info("Click **Review** on any veteran in the queue to open the SC classification detail and take an authorization action.")
 
+    # Audit trail
     if st.session_state.sc_audit:
         st.markdown("---")
         st.markdown("### 📝 Audit Trail (FISMA)")
         for entry in reversed(st.session_state.sc_audit[-6:]):
-            color = {"AUTHORIZED":"#22C55E","PENDED":"#F59E0B","DENIED":"#FF5C6B"}.get(entry["action"],"#7256F6")
+            color   = {"AUTHORIZED":"#22C55E","PENDED":"#F59E0B","DENIED":"#FF5C6B"}.get(entry["action"],"#7256F6")
             rev_str = f"${entry['revenue']:,}" if entry["action"] == "AUTHORIZED" else "—"
+            billing_str = entry.get("billing", "")
             st.markdown(f"""
             <div class='audit-entry'>
                 <span style='color:{color}; font-weight:bold;'>{entry['action']}</span>
                 &nbsp;·&nbsp; {entry['patient']}
                 &nbsp;·&nbsp; {rev_str}
+                {f"&nbsp;·&nbsp; <span style='font-size:11px; color:#666;'>{billing_str}</span>" if billing_str else ""}
                 &nbsp;·&nbsp; {entry['reviewer']}
                 &nbsp;·&nbsp; <span style='color:#888;'>{entry['ts']}</span>
             </div>
