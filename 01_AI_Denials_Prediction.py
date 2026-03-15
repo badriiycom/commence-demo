@@ -25,11 +25,11 @@ def load_carc():
 CARC = load_carc()
 
 # ── FHIR helpers ──────────────────────────────────────────────────
-FHIR_BASE = "https://hapi.fhir.org/baseR4"
+FHIR_BASE = "https://server.fire.ly/r4"
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_eobs(count=20):
-    """Fetch ExplanationOfBenefit resources from HAPI FHIR"""
+    """Fetch ExplanationOfBenefit resources from FIRE FHIR"""
     try:
         r = requests.get(
             f"{FHIR_BASE}/ExplanationOfBenefit",
