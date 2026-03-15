@@ -46,7 +46,7 @@ def fetch_eobs(count=20):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_patients(count=20):
-    """Fetch Patient resources from HAPI FHIR"""
+    """Fetch Patient resources from FIRE FHIR"""
     try:
         r = requests.get(
             f"{FHIR_BASE}/Patient",
@@ -496,6 +496,6 @@ with right_col:
 st.markdown("---")
 st.caption(
     "Commence · AI Denials Prediction · "
-    f"Data: CMS CARC/RARC · FHIR R4 ({'hapi.fhir.org — live' if use_live else 'offline synthetic fallback'}) · "
+    f"Data: CMS CARC/RARC · FHIR R4 ({'server.fire.ly — live' if use_live else 'offline synthetic fallback'}) · "
     "CFR 38 · VA RO/CPAC Industry Day Demo · Sol. 36C10X26Q0085"
 )
