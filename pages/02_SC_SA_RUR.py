@@ -30,9 +30,6 @@ PACT_CODES    = load_pact()
 FHIR_BASE = "https://server.fire.ly/r4"
 
 # ── SNOMED to ICD-10 mapping ──────────────────────────────────────
-# Synthea generates SNOMED as primary coding system.
-# This maps common veteran SNOMED codes to ICD-10 equivalents
-# so the SC/SA matching engine can find CFR 38 VASRD matches.
 SNOMED_TO_ICD10 = {
     # Mental Health
     "47505003":  {"code": "F43.10", "display": "PTSD"},
@@ -107,19 +104,18 @@ def determine_billing_authority(matches, has_pact):
     Determine MCCF vs Non-MCCF billing authority based on
     SC condition matches and PACT Act status.
 
-    MCCF (38 USC 1729):
-      Standard third-party OHI billing for non-SC conditions.
-      Veteran copayment may apply.
-
-    Non-MCCF (38 USC 1722A / PACT Act PL 117-168):
+    NON-MCCF (38 USC 1722A):
       SC-confirmed or PACT Act presumptive conditions.
       Veteran exempt from copayment.
       Third-party recovery still applicable.
-    """
-    has_sc_match  = len(matches) > 0
-    has_pact_match = has_pact
 
-    if has_pact_match:
+    MCCF (38 USC 1729):
+      No SC match. Standard third-party OHI billing.
+      Veteran copayment may apply.
+    """
+    has_sc_match = len(matches) > 0
+
+    if has_pact:
         return {
             "status":           "NON-MCCF",
             "authority":        "38 USC 1722A / PACT Act PL 117-168",
@@ -171,7 +167,7 @@ def fetch_patients_with_conditions(count=16):
         )
         if r.status_code != 200:
             return [], "offline"
-        bundle = r.json()
+        bundle  = r.json()
         entries = bundle.get("entry", [])
         patients = [e["resource"] for e in entries if "resource" in e]
 
@@ -188,18 +184,15 @@ def fetch_patients_with_conditions(count=16):
                 if cr.status_code == 200:
                     cb = cr.json()
                     for ce in cb.get("entry", []):
-                        res = ce.get("resource", {})
+                        res      = ce.get("resource", {})
                         code_obj = res.get("code", {})
                         for coding in code_obj.get("coding", []):
                             system  = coding.get("system", "")
                             code    = coding.get("code", "")
                             display = coding.get("display", code_obj.get("text", "Unknown"))
 
-                            # Accept ICD-10 directly
                             if system.startswith("http://hl7.org/fhir/sid/icd"):
                                 conds.append({"code": code, "display": display})
-
-                            # Map SNOMED to ICD-10 equivalent
                             elif system.startswith("http://snomed.info/sct"):
                                 mapped = SNOMED_TO_ICD10.get(code)
                                 if mapped:
@@ -207,7 +200,6 @@ def fetch_patients_with_conditions(count=16):
                                         "code":    mapped["code"],
                                         "display": mapped["display"]
                                     })
-
             except Exception:
                 conds = []
 
@@ -218,12 +210,8 @@ def fetch_patients_with_conditions(count=16):
 
 # ── SC matching engine ────────────────────────────────────────────
 def match_sc_conditions(icd10_codes):
-    """
-    Match ICD-10 codes against CFR 38 VASRD SC condition table.
-    Returns list of matched conditions with confidence scores.
-    """
     matches = []
-    seen = set()
+    seen    = set()
     for code_obj in icd10_codes:
         code    = code_obj.get("code", "")
         display = code_obj.get("display", "")
@@ -232,7 +220,7 @@ def match_sc_conditions(icd10_codes):
 
         for prefix in [prefix3, prefix2]:
             if prefix in SC_CONDITIONS and prefix not in seen:
-                sc = SC_CONDITIONS[prefix]
+                sc  = SC_CONDITIONS[prefix]
                 seen.add(prefix)
 
                 base       = 0.88 if len(prefix) == 3 else 0.72
@@ -241,7 +229,6 @@ def match_sc_conditions(icd10_codes):
                 confidence = min(0.97, max(0.45, base + jitter))
 
                 rating_pcts = sc["rating_pcts"]
-                max_rating  = max(rating_pcts)
                 est_revenue = int(sc["revenue_est"] * confidence)
 
                 pact_match = None
@@ -256,7 +243,7 @@ def match_sc_conditions(icd10_codes):
                     "sc_condition":  sc["condition"],
                     "cfr_ref":       sc["cfr_ref"],
                     "confidence":    confidence,
-                    "max_rating":    max_rating,
+                    "max_rating":    max(rating_pcts),
                     "rating_pcts":   rating_pcts,
                     "revenue_est":   est_revenue,
                     "category":      sc["category"],
@@ -276,34 +263,33 @@ def synthetic_patients():
     ]
     scenarios = [
         [{"code":"F43.10","display":"PTSD, unspecified"},{"code":"M54.5","display":"Low back pain"}],
-        [{"code":"M17.11","display":"Primary osteoarthritis, right knee"},{"code":"F32.1","display":"Major depressive disorder, single episode, moderate"}],
-        [{"code":"G43.909","display":"Migraine, unspecified"},{"code":"I10","display":"Essential (primary) hypertension"}],
+        [{"code":"M17.11","display":"Primary osteoarthritis, right knee"},{"code":"F32.1","display":"Major depressive disorder, moderate"}],
+        [{"code":"G43.909","display":"Migraine, unspecified"},{"code":"I10","display":"Essential hypertension"}],
         [{"code":"E11.9","display":"Type 2 diabetes mellitus without complications"}],
-        [{"code":"S09.90XA","display":"Unspecified injury of head, init"},{"code":"F41.1","display":"Generalized anxiety disorder"}],
-        [{"code":"F41.1","display":"Generalized anxiety disorder"},{"code":"M79.3","display":"Panniculitis, unspecified"}],
-        [{"code":"I25.10","display":"Atherosclerotic heart disease of native coronary artery"},{"code":"I10","display":"Hypertension"}],
-        [{"code":"J45.40","display":"Moderate persistent asthma, uncomplicated"},{"code":"M75.1","display":"Rotator cuff syndrome"}],
-        [{"code":"H91.90","display":"Unspecified hearing loss, unspecified ear"},{"code":"H83.01","display":"Tinnitus, right ear"}],
-        [{"code":"G54.2","display":"Cervical root disorders"},{"code":"M47.812","display":"Spondylosis with radiculopathy, cervical region"}],
-        [{"code":"C34.90","display":"Malignant neoplasm of bronchus and lung"},{"code":"J68.0","display":"Bronchitis and pneumonitis due to solids and liquids"}],
-        [{"code":"F32.9","display":"Major depressive disorder, single episode, unspecified"},{"code":"F43.10","display":"PTSD, unspecified"}],
-        [{"code":"M17.31","display":"Secondary osteoarthritis, right knee"},{"code":"G43.019","display":"Migraine without aura, intractable"}],
+        [{"code":"S09.90XA","display":"Unspecified injury of head"},{"code":"F41.1","display":"Generalized anxiety disorder"}],
+        [{"code":"F41.1","display":"Generalized anxiety disorder"},{"code":"M79.3","display":"Panniculitis"}],
+        [{"code":"I25.10","display":"Atherosclerotic heart disease"},{"code":"I10","display":"Hypertension"}],
+        [{"code":"J45.40","display":"Moderate persistent asthma"},{"code":"M75.1","display":"Rotator cuff syndrome"}],
+        [{"code":"H91.90","display":"Unspecified hearing loss"},{"code":"H83.01","display":"Tinnitus, right ear"}],
+        [{"code":"G54.2","display":"Cervical root disorders"},{"code":"M47.812","display":"Cervical spondylosis"}],
+        [{"code":"C34.90","display":"Malignant neoplasm of bronchus"},{"code":"J68.0","display":"Toxic bronchitis"}],
+        [{"code":"F32.9","display":"Major depressive disorder"},{"code":"F43.10","display":"PTSD"}],
+        [{"code":"M17.31","display":"Secondary osteoarthritis, right knee"},{"code":"G43.019","display":"Migraine without aura"}],
         [{"code":"J44.1","display":"COPD with acute exacerbation"},{"code":"I10","display":"Hypertension"}],
-        [{"code":"S06.0X1A","display":"Concussion with LOC <30 min"},{"code":"G89.21","display":"Chronic pain due to trauma"}],
-        [{"code":"E10.9","display":"Type 1 diabetes mellitus without complications"},{"code":"I25.10","display":"Ischemic heart disease"}],
+        [{"code":"S06.0X1A","display":"Concussion with LOC"},{"code":"G89.21","display":"Chronic pain due to trauma"}],
+        [{"code":"E10.9","display":"Type 1 diabetes mellitus"},{"code":"I25.10","display":"Ischemic heart disease"}],
     ]
     random.seed(42)
     result = []
     for i, (fname, lname) in enumerate(names):
         dob = datetime.date(1960 + (i*3)%30, (i%12)+1, (i*7%28)+1)
-        conditions = scenarios[i % len(scenarios)]
         pat = {
             "id":        f"SYN-{1000+i}",
             "name":      [{"given":[fname],"family":lname}],
             "birthDate": dob.isoformat(),
             "gender":    "male" if i%3!=1 else "female"
         }
-        result.append({"patient":pat, "conditions":conditions})
+        result.append({"patient": pat, "conditions": scenarios[i % len(scenarios)]})
     random.seed()
     return result
 
@@ -318,7 +304,6 @@ st.markdown("""
     .cfr-tag     { background:#E0F4FF; color:#0369A1; padding:2px 8px; border-radius:4px; font-size:11px; font-family:monospace; }
     .audit-entry { background:#F0FFF8; border-radius:6px; padding:8px 12px; margin:4px 0; font-size:13px; border-left:3px solid #22C55E; }
     .pipeline-stage { text-align:center; padding:8px; border-radius:6px; font-size:12px; font-weight:bold; }
-    .billing-panel { border-radius:10px; padding:14px 16px; margin:10px 0; }
     h1, h2, h3 { color: #0A2A1A !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -344,18 +329,15 @@ with st.spinner("Connecting to FHIR server..."):
     patient_data, fhir_status = fetch_patients_with_conditions(16)
 
 if fhir_status == "live" and patient_data and has_icd10_data(patient_data):
-    st.success(f"✅ **FHIR R4 Live** — real patient data loaded · CFR 38 matching active")
+    st.success("✅ **FHIR R4 Live** — real patient data loaded · CFR 38 matching active")
 else:
     st.success("✅ **VA Representative Dataset** — 16 veteran profiles loaded · CFR 38 VASRD matching active · PACT Act 2022 included")
     patient_data = synthetic_patients()
 
 # ── Session state ─────────────────────────────────────────────────
-if "sc_audit" not in st.session_state:
-    st.session_state.sc_audit = []
-if "patient_stages" not in st.session_state:
-    st.session_state.patient_stages = {}
-if "selected_patient" not in st.session_state:
-    st.session_state.selected_patient = None
+if "sc_audit"         not in st.session_state: st.session_state.sc_audit         = []
+if "patient_stages"   not in st.session_state: st.session_state.patient_stages   = {}
+if "selected_patient" not in st.session_state: st.session_state.selected_patient = None
 
 # ── Pipeline header ───────────────────────────────────────────────
 st.markdown("### SC/SA RUR Pipeline")
@@ -364,55 +346,51 @@ stage_colors = ["#7256F6","#22C55E","#51B3FA","#F59E0B","#9FE9F2","#E0F972"]
 cols = st.columns(len(stages))
 for i, (stage, color) in enumerate(zip(stages, stage_colors)):
     with cols[i]:
-        st.markdown(f"""
-        <div class='pipeline-stage' style='background:{color}22; border:2px solid {color}; color:#111;'>
-            {stage}
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='pipeline-stage' style='background:{color}22; border:2px solid {color}; color:#111;'>{stage}</div>",
+            unsafe_allow_html=True
+        )
 
 st.markdown("---")
 
 # ── Build patient SC data ─────────────────────────────────────────
 all_patients = []
 for pd_entry in patient_data:
-    pat   = pd_entry["patient"]
-    conds = pd_entry["conditions"]
+    pat     = pd_entry["patient"]
+    conds   = pd_entry["conditions"]
     matches = match_sc_conditions(conds)
     if not matches and conds:
         continue
 
-    pat_id   = pat.get("id","")
-    name_obj = pat.get("name",[{}])[0]
-    fname    = name_obj.get("given",["Veteran"])[0]
-    lname    = name_obj.get("family","V")
-    dob      = pat.get("birthDate","1970-01-01")
-    gender   = pat.get("gender","unknown")
+    pat_id   = pat.get("id", "")
+    name_obj = pat.get("name", [{}])[0]
+    fname    = name_obj.get("given", ["Veteran"])[0]
+    lname    = name_obj.get("family", "V")
+    dob      = pat.get("birthDate", "1970-01-01")
+    gender   = pat.get("gender", "unknown")
 
     try:
         age = datetime.date.today().year - int(dob[:4])
     except Exception:
         age = 55
 
-    top_match  = matches[0] if matches else None
-    total_rev  = sum(m["revenue_est"] for m in matches)
-    max_conf   = max((m["confidence"] for m in matches), default=0)
-    has_pact   = any(m["pact"] for m in matches)
-    billing    = determine_billing_authority(matches, has_pact)
+    has_pact = any(m["pact"] for m in matches)
+    billing  = determine_billing_authority(matches, has_pact)
 
     all_patients.append({
-        "id":            pat_id,
-        "name":          f"{fname} {lname[0]}.",
-        "age":           age,
-        "gender":        gender,
-        "dob":           dob,
-        "conditions":    conds,
-        "matches":       matches,
-        "top_match":     top_match,
-        "total_revenue": total_rev,
-        "max_confidence":max_conf,
-        "has_pact":      has_pact,
-        "billing":       billing,
-        "stage":         st.session_state.patient_stages.get(pat_id, "SC Eligibility")
+        "id":             pat_id,
+        "name":           f"{fname} {lname[0]}.",
+        "age":            age,
+        "gender":         gender,
+        "dob":            dob,
+        "conditions":     conds,
+        "matches":        matches,
+        "top_match":      matches[0] if matches else None,
+        "total_revenue":  sum(m["revenue_est"] for m in matches),
+        "max_confidence": max((m["confidence"] for m in matches), default=0),
+        "has_pact":       has_pact,
+        "billing":        billing,
+        "stage":          st.session_state.patient_stages.get(pat_id, "SC Eligibility")
     })
 
 all_patients = sorted(all_patients, key=lambda x: -x["max_confidence"])
@@ -421,11 +399,9 @@ all_patients = sorted(all_patients, key=lambda x: -x["max_confidence"])
 with st.sidebar:
     st.markdown("### 🔍 Filters")
     conf_filter = st.selectbox("SC Confidence", ["All", "High (≥80%)", "Medium (50–79%)", "Low (<50%)"])
-    cat_options = ["All"] + sorted(list(set(
-        m["category"] for p in all_patients for m in p["matches"]
-    )))
-    cat_filter = st.selectbox("Condition Category", cat_options)
-    pact_only  = st.checkbox("PACT Act cases only")
+    cat_options = ["All"] + sorted(list(set(m["category"] for p in all_patients for m in p["matches"])))
+    cat_filter  = st.selectbox("Condition Category", cat_options)
+    pact_only   = st.checkbox("PACT Act cases only")
 
     st.markdown("---")
     st.markdown("### 📊 AI Classification")
@@ -444,7 +420,7 @@ with st.sidebar:
     **FHIR:** server.fire.ly/r4  
     **SC Map:** CFR 38 Part 4 VASRD  
     **PACT Act:** Pub.L. 117-168  
-    **Status:** {'🟢 Live FHIR' if fhir_status=='live' else '🟡 Offline mode'}
+    **Status:** {'🟢 Live FHIR' if fhir_status == 'live' else '🟡 Offline mode'}
     """)
 
 # ── Apply filters ─────────────────────────────────────────────────
@@ -456,7 +432,7 @@ elif conf_filter == "Medium (50–79%)":
 elif conf_filter == "Low (<50%)":
     filtered_patients = [p for p in filtered_patients if p["max_confidence"] < 0.50]
 if cat_filter != "All":
-    filtered_patients = [p for p in filtered_patients if any(m["category"]==cat_filter for m in p["matches"])]
+    filtered_patients = [p for p in filtered_patients if any(m["category"] == cat_filter for m in p["matches"])]
 if pact_only:
     filtered_patients = [p for p in filtered_patients if p["has_pact"]]
 
@@ -476,7 +452,8 @@ with main_col:
     for pat in filtered_patients:
         conf        = pat["max_confidence"]
         tier        = "high" if conf >= 0.80 else "med" if conf >= 0.50 else "low"
-        badge_label = f"{conf*100:.0f}% SC Match"
+        billing     = pat["billing"]
+        b_color     = billing["color"]
 
         with st.container():
             c1, c2, c3, c4, c5 = st.columns([2, 2, 1.5, 1.5, 1])
@@ -490,21 +467,18 @@ with main_col:
                 else:
                     st.markdown("*No SC match*")
             with c3:
-                st.markdown(f"<span class='badge-{tier}'>{badge_label}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span class='badge-{tier}'>{conf*100:.0f}% SC Match</span>", unsafe_allow_html=True)
                 st.progress(conf)
             with c4:
-                billing = pat["billing"]
-                b_color = "#FF5C6B" if billing["status"] == "NON-MCCF" else "#22C55E"
                 st.markdown(
-                    f"<span style='background:{b_color}22; color:{b_color}; "
-                    f"padding:2px 8px; border-radius:8px; font-size:11px; font-weight:bold;'>"
-                    f"{billing['status']}</span>",
+                    f"<span style='background:{b_color}22; color:{b_color}; padding:2px 8px; "
+                    f"border-radius:8px; font-size:11px; font-weight:bold;'>{billing['status']}</span>",
                     unsafe_allow_html=True
                 )
                 st.markdown(f"**${pat['total_revenue']:,}** est.")
             with c5:
                 stage = st.session_state.patient_stages.get(pat["id"], "SC Eligibility")
-                if stage in ["Authorized","Billed"]:
+                if stage in ["Authorized", "Billed"]:
                     st.success(f"✅ {stage}")
                 elif st.button("Review", key=f"rev_{pat['id']}"):
                     st.session_state.selected_patient = pat
@@ -516,22 +490,20 @@ with detail_col:
         pat = st.session_state.selected_patient
         st.markdown(f"### 🔍 {pat['name']} — SC Detail")
 
-        # Pipeline progress
         current_stage = st.session_state.patient_stages.get(pat["id"], "SC Eligibility")
         stage_idx     = stages.index(current_stage) if current_stage in stages else 1
-        progress      = (stage_idx + 1) / len(stages)
-        st.progress(progress)
+        st.progress((stage_idx + 1) / len(stages))
         st.caption(f"Current stage: **{current_stage}**")
 
-        # SC Condition Matches
+        # ── SC Condition Matches ──────────────────────────────────
         st.markdown("**SC Condition Matches — CFR 38 VASRD**")
         for m in pat["matches"][:4]:
-            conf_pct   = int(m["confidence"]*100)
+            conf_pct   = int(m["confidence"] * 100)
             conf_color = "#22C55E" if conf_pct >= 80 else "#F59E0B" if conf_pct >= 50 else "#7256F6"
-            pact_html  = ""
-            if m["pact"]:
-                pact_html = f"<br><span class='pact-badge'>🔴 PACT ACT: {m['pact']['notes']}</span>"
-
+            pact_html  = (
+                f"<br><span class='pact-badge'>🔴 PACT ACT: {m['pact']['notes']}</span>"
+                if m["pact"] else ""
+            )
             st.markdown(f"""
             <div style='background:white; border-radius:8px; padding:10px 14px; margin:6px 0;
                         border-left:4px solid {conf_color}; box-shadow:0 1px 4px rgba(0,0,0,0.08);'>
@@ -539,7 +511,7 @@ with detail_col:
                     <div>
                         <strong style='color:#0A2A1A;'>{m['sc_condition']}</strong><br>
                         <code style='font-size:11px; color:#0369A1;'>{m['icd10']}</code>
-                        &nbsp; <span class='cfr-tag'>{m['cfr_ref']}</span>
+                        &nbsp;<span class='cfr-tag'>{m['cfr_ref']}</span>
                     </div>
                     <div style='text-align:right;'>
                         <strong style='color:{conf_color}; font-size:18px;'>{conf_pct}%</strong><br>
@@ -557,31 +529,38 @@ with detail_col:
         st.markdown("---")
         st.markdown("**⚖️ Billing Authority Determination**")
 
-        billing    = pat["billing"]
-        b_color    = billing["color"]
-        b_status   = billing["status"]
-        b_auth     = billing["authority"]
-        b_copay    = billing["copayment"]
-        b_tp       = billing["third_party"]
-        b_action   = billing["action"]
-        b_review   = billing["human_review"]
-        b_reason   = billing["review_reason"]
-        b_revenue  = pat["total_revenue"]
+        billing   = pat["billing"]
+        b_color   = billing["color"]
+        b_revenue = pat["total_revenue"]
+
+        # Build review reason row separately to avoid nested f-string issues
+        review_row = ""
+        if billing["review_reason"]:
+            review_row = (
+                "<tr>"
+                "<td style='color:#666; padding:3px 0;'>Review Reason</td>"
+                f"<td style='font-size:11px; color:#666;'>{billing['review_reason']}</td>"
+                "</tr>"
+            )
 
         st.markdown(f"""
-        <div class='billing-panel' style='background:{b_color}11; border:2px solid {b_color};'>
-            <div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>
-                <span style='font-size:18px; font-weight:bold; color:{b_color};'>{b_status}</span>
-                <span style='font-size:12px; color:#444; font-family:monospace;'>{b_auth}</span>
+        <div style='background:{b_color}11; border:2px solid {b_color};
+                    border-radius:10px; padding:14px 16px; margin:10px 0;'>
+            <div style='display:flex; justify-content:space-between;
+                        align-items:center; margin-bottom:10px;'>
+                <span style='font-size:18px; font-weight:bold;
+                             color:{b_color};'>{billing['status']}</span>
+                <span style='font-size:12px; color:#444;
+                             font-family:monospace;'>{billing['authority']}</span>
             </div>
             <table style='width:100%; font-size:12px; border-collapse:collapse;'>
                 <tr>
                     <td style='color:#666; padding:3px 0; width:45%;'>Veteran Liability</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{b_copay}</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{billing['copayment']}</td>
                 </tr>
                 <tr>
                     <td style='color:#666; padding:3px 0;'>Third-party Recovery</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{b_tp}</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{billing['third_party']}</td>
                 </tr>
                 <tr>
                     <td style='color:#666; padding:3px 0;'>Est. Revenue</td>
@@ -589,18 +568,19 @@ with detail_col:
                 </tr>
                 <tr>
                     <td style='color:#666; padding:3px 0;'>Human Review</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{'Required ⚠️' if b_review else 'Not required'}</td>
+                    <td style='font-weight:bold; color:#0A2A1A;'>{'Required ⚠️' if billing['human_review'] else 'Not required'}</td>
                 </tr>
-                {f"<tr><td style='color:#666; padding:3px 0;'>Review Reason</td><td style='font-size:11px; color:#666;'>{b_reason}</td></tr>" if b_reason else ""}
+                {review_row}
             </table>
-            <div style='margin-top:10px; padding:8px; background:{b_color}22; border-radius:6px;
-                        font-size:12px; color:{b_color}; font-weight:bold;'>
-                → {b_action}
+            <div style='margin-top:10px; padding:8px; background:{b_color}22;
+                        border-radius:6px; font-size:12px; color:{b_color};
+                        font-weight:bold;'>
+                → {billing['action']}
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Authorize SC Determination
+        # ── Authorize SC Determination ────────────────────────────
         st.markdown("---")
         st.markdown("**Authorize SC Determination**")
         reviewer  = st.text_input("VA Staff ID", key="sc_reviewer",
@@ -668,29 +648,33 @@ with detail_col:
         st.markdown("### 👆 Select a veteran to review")
         st.info("Click **Review** on any veteran in the queue to open the SC classification detail and take an authorization action.")
 
-    # Audit trail
+    # ── Audit trail ───────────────────────────────────────────────
     if st.session_state.sc_audit:
         st.markdown("---")
         st.markdown("### 📝 Audit Trail (FISMA)")
         for entry in reversed(st.session_state.sc_audit[-6:]):
-            color   = {"AUTHORIZED":"#22C55E","PENDED":"#F59E0B","DENIED":"#FF5C6B"}.get(entry["action"],"#7256F6")
-            rev_str = f"${entry['revenue']:,}" if entry["action"] == "AUTHORIZED" else "—"
+            color       = {"AUTHORIZED":"#22C55E","PENDED":"#F59E0B","DENIED":"#FF5C6B"}.get(entry["action"],"#7256F6")
+            rev_str     = f"${entry['revenue']:,}" if entry["action"] == "AUTHORIZED" else "—"
             billing_str = entry.get("billing", "")
+            billing_tag = (
+                f"&nbsp;·&nbsp;<span style='font-size:11px; color:#666;'>{billing_str}</span>"
+                if billing_str else ""
+            )
             st.markdown(f"""
             <div class='audit-entry'>
                 <span style='color:{color}; font-weight:bold;'>{entry['action']}</span>
-                &nbsp;·&nbsp; {entry['patient']}
-                &nbsp;·&nbsp; {rev_str}
-                {f"&nbsp;·&nbsp; <span style='font-size:11px; color:#666;'>{billing_str}</span>" if billing_str else ""}
-                &nbsp;·&nbsp; {entry['reviewer']}
-                &nbsp;·&nbsp; <span style='color:#888;'>{entry['ts']}</span>
+                &nbsp;·&nbsp;{entry['patient']}
+                &nbsp;·&nbsp;{rev_str}
+                {billing_tag}
+                &nbsp;·&nbsp;{entry['reviewer']}
+                &nbsp;·&nbsp;<span style='color:#888;'>{entry['ts']}</span>
             </div>
             """, unsafe_allow_html=True)
 
         authorized = [e for e in st.session_state.sc_audit if e["action"] == "AUTHORIZED"]
         if authorized:
-            total_auth = sum(e["revenue"] for e in authorized)
-            st.metric("Total Revenue Authorized This Session", f"${total_auth:,}")
+            st.metric("Total Revenue Authorized This Session",
+                      f"${sum(e['revenue'] for e in authorized):,}")
 
 # ── Footer ────────────────────────────────────────────────────────
 st.markdown("---")
