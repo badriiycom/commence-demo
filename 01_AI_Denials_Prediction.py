@@ -309,7 +309,7 @@ with st.sidebar:
     st.markdown("### 🔗 Architecture")
     st.markdown(f"""
     **FHIR Endpoint:**  
-    `hapi.fhir.org/baseR4`  
+    `server.fire.ly.r4`  
     *(Cerner Millennium spec)*  
     **Denial Data:** CMS CARC/RARC  
     **Status:** {'🟢 Live' if use_live else '🟡 Offline fallback'}
