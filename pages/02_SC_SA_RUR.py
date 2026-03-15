@@ -27,7 +27,7 @@ def load_pact():
 SC_CONDITIONS = {c["icd10_prefix"]: c for c in load_sc()}
 PACT_CODES    = load_pact()
 
-FHIR_BASE = "https://hapi.fhir.org/baseR4"
+FHIR_BASE = "https://server.fire.ly/r4"
 
 # ── FHIR fetch ────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
@@ -294,7 +294,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔗 Data Sources")
     st.markdown(f"""
-    **FHIR:** hapi.fhir.org/baseR4  
+    **FHIR:** server.fire.ly/r4  
     **SC Map:** CFR 38 Part 4 VASRD  
     **PACT Act:** Pub.L. 117-168  
     **Status:** {'🟢 Live FHIR' if fhir_status=='live' else '🟡 Offline mode'}
