@@ -29,12 +29,90 @@ PACT_CODES    = load_pact()
 
 FHIR_BASE = "https://server.fire.ly/r4"
 
+# ── SNOMED to ICD-10 mapping ──────────────────────────────────────
+# Synthea generates SNOMED as primary coding system.
+# This maps common veteran SNOMED codes to ICD-10 equivalents
+# so the SC/SA matching engine can find CFR 38 VASRD matches.
+SNOMED_TO_ICD10 = {
+    # Mental Health
+    "47505003":  {"code": "F43.10", "display": "PTSD"},
+    "313182004": {"code": "F43.10", "display": "PTSD chronic"},
+    "192127007": {"code": "F43.10", "display": "PTSD"},
+    "35489007":  {"code": "F32.9",  "display": "Major depressive disorder"},
+    "370143000": {"code": "F32.9",  "display": "Major depression"},
+    "36923009":  {"code": "F32.9",  "display": "Major depression single episode"},
+    "48694002":  {"code": "F41.1",  "display": "Anxiety disorder"},
+    "197480006": {"code": "F41.1",  "display": "Anxiety disorder"},
+    "386810004": {"code": "F41.1",  "display": "Generalized anxiety"},
+    "40568001":  {"code": "F41.1",  "display": "Recurrent anxiety"},
+    "191736004": {"code": "F41.1",  "display": "Anxiety state"},
+    "7200002":   {"code": "F10.20", "display": "Alcohol use disorder"},
+    "66590003":  {"code": "F10.20", "display": "Alcohol dependence"},
+    # Musculoskeletal
+    "279039007": {"code": "M54.5",  "display": "Low back pain"},
+    "57676002":  {"code": "M17.11", "display": "Knee osteoarthritis"},
+    "239872002": {"code": "M17.11", "display": "Knee osteoarthritis"},
+    "57545000":  {"code": "M79.3",  "display": "Fibromyalgia"},
+    "202855006": {"code": "M75.1",  "display": "Rotator cuff syndrome"},
+    "73583000":  {"code": "M17.11", "display": "Knee pain"},
+    "82423001":  {"code": "M54.5",  "display": "Chronic pain"},
+    "263102004": {"code": "M75.1",  "display": "Rotator cuff injury"},
+    "45326000":  {"code": "M54.5",  "display": "Shoulder pain"},
+    "72696002":  {"code": "M17.11", "display": "Knee pain"},
+    "298705000": {"code": "M54.5",  "display": "Back pain"},
+    "161891005": {"code": "M54.5",  "display": "Backache"},
+    "44465007":  {"code": "M79.3",  "display": "Sprain"},
+    "444798002": {"code": "M47.812","display": "Cervical spondylosis"},
+    "267935007": {"code": "M47.812","display": "Cervical spondylosis"},
+    # Cardiovascular
+    "59621000":  {"code": "I10",    "display": "Hypertension"},
+    "38341003":  {"code": "I10",    "display": "Hypertension"},
+    "53741008":  {"code": "I25.10", "display": "Ischemic heart disease"},
+    "414545008": {"code": "I25.10", "display": "Ischemic heart disease"},
+    "84114007":  {"code": "I50.9",  "display": "Heart failure"},
+    "44054006":  {"code": "I25.10", "display": "Coronary artery disease"},
+    "230690007": {"code": "I25.10", "display": "Cerebrovascular disease"},
+    # Respiratory
+    "13645005":  {"code": "J44.9",  "display": "COPD"},
+    "195967001": {"code": "J45.40", "display": "Asthma"},
+    "370218001": {"code": "J44.1",  "display": "COPD exacerbation"},
+    "57607007":  {"code": "J44.1",  "display": "COPD"},
+    "413839001": {"code": "J44.9",  "display": "Chronic lung disease"},
+    # Neurological
+    "37796009":  {"code": "G43.909","display": "Migraine"},
+    "230461009": {"code": "G43.909","display": "Migraine"},
+    "193462001": {"code": "G43.909","display": "Migraine"},
+    "4473006":   {"code": "G43.909","display": "Migraine with aura"},
+    "230462002": {"code": "G43.909","display": "Migraine without aura"},
+    "128613002": {"code": "G54.2",  "display": "Cervical radiculopathy"},
+    "202794003": {"code": "G54.2",  "display": "Cervical radiculopathy"},
+    # Sensory
+    "15188001":  {"code": "H91.90", "display": "Hearing loss"},
+    "371281002": {"code": "H91.90", "display": "Hearing loss"},
+    "60862001":  {"code": "H83.09", "display": "Tinnitus"},
+    "309385003": {"code": "H91.90", "display": "Hearing loss"},
+    # Endocrine
+    "44054006":  {"code": "E11.9",  "display": "Type 2 diabetes"},
+    "73211009":  {"code": "E11.9",  "display": "Diabetes mellitus"},
+    "46635009":  {"code": "E10.9",  "display": "Type 1 diabetes"},
+    "190330002": {"code": "E11.9",  "display": "Diabetes type 2"},
+    # TBI
+    "110030002": {"code": "S09.90", "display": "TBI"},
+    "62106007":  {"code": "S09.90", "display": "Concussion"},
+    "81371004":  {"code": "S06.0X0","display": "Concussion"},
+    "230690007": {"code": "S09.90", "display": "Brain injury"},
+}
+
 # ── FHIR fetch ────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_patients_with_conditions(count=16):
-    """Fetch patients then pull their conditions from HAPI FHIR"""
+    """Fetch patients then pull their conditions from Firely FHIR"""
     try:
-        r = requests.get(f"{FHIR_BASE}/Patient", params={"_count": count, "_format": "json"}, timeout=8)
+        r = requests.get(
+            f"{FHIR_BASE}/Patient",
+            params={"_count": count, "_format": "json"},
+            timeout=8
+        )
         if r.status_code != 200:
             return [], "offline"
         bundle = r.json()
@@ -43,10 +121,13 @@ def fetch_patients_with_conditions(count=16):
 
         result = []
         for pat in patients[:count]:
-            pat_id = pat.get("id","")
+            pat_id = pat.get("id", "")
             try:
-                cr = requests.get(f"{FHIR_BASE}/Condition",
-                    params={"patient": pat_id, "_count": 8, "_format": "json"}, timeout=5)
+                cr = requests.get(
+                    f"{FHIR_BASE}/Condition",
+                    params={"patient": pat_id, "_count": 20, "_format": "json"},
+                    timeout=5
+                )
                 conds = []
                 if cr.status_code == 200:
                     cb = cr.json()
@@ -54,13 +135,26 @@ def fetch_patients_with_conditions(count=16):
                         res = ce.get("resource", {})
                         code_obj = res.get("code", {})
                         for coding in code_obj.get("coding", []):
-                            if coding.get("system","").startswith("http://hl7.org/fhir/sid/icd"):
+                            system = coding.get("system", "")
+                            code   = coding.get("code", "")
+                            display = coding.get("display", code_obj.get("text", "Unknown"))
+
+                            # Accept ICD-10 directly
+                            if system.startswith("http://hl7.org/fhir/sid/icd"):
                                 conds.append({
-                                    "code": coding.get("code",""),
-                                    "display": coding.get("display", code_obj.get("text","Unknown"))
+                                    "code": code,
+                                    "display": display
                                 })
-                            elif coding.get("system","").startswith("http://snomed"):
-                                pass
+
+                            # Map SNOMED to ICD-10 equivalent
+                            elif system.startswith("http://snomed.info/sct"):
+                                mapped = SNOMED_TO_ICD10.get(code)
+                                if mapped:
+                                    conds.append({
+                                        "code": mapped["code"],
+                                        "display": mapped["display"]
+                                    })
+
             except Exception:
                 conds = []
 
@@ -78,8 +172,8 @@ def match_sc_conditions(icd10_codes):
     matches = []
     seen = set()
     for code_obj in icd10_codes:
-        code = code_obj.get("code","")
-        display = code_obj.get("display","")
+        code = code_obj.get("code", "")
+        display = code_obj.get("display", "")
         prefix3 = code[:3]
         prefix2 = code[:2]
 
@@ -88,7 +182,6 @@ def match_sc_conditions(icd10_codes):
                 sc = SC_CONDITIONS[prefix]
                 seen.add(prefix)
 
-                # Confidence: exact 3-char match scores higher
                 base = 0.88 if len(prefix) == 3 else 0.72
                 h = sum(ord(c) for c in code)
                 jitter = ((h % 15) - 7) / 100
@@ -105,16 +198,16 @@ def match_sc_conditions(icd10_codes):
                         break
 
                 matches.append({
-                    "icd10": code,
+                    "icd10":        code,
                     "icd10_display": display or sc["condition"],
                     "sc_condition": sc["condition"],
-                    "cfr_ref": sc["cfr_ref"],
-                    "confidence": confidence,
-                    "max_rating": max_rating,
-                    "rating_pcts": rating_pcts,
-                    "revenue_est": est_revenue,
-                    "category": sc["category"],
-                    "pact": pact_match
+                    "cfr_ref":      sc["cfr_ref"],
+                    "confidence":   confidence,
+                    "max_rating":   max_rating,
+                    "rating_pcts":  rating_pcts,
+                    "revenue_est":  est_revenue,
+                    "category":     sc["category"],
+                    "pact":         pact_match
                 })
     return sorted(matches, key=lambda x: -x["confidence"])
 
@@ -201,7 +294,7 @@ if fhir_status == "live" and patient_data and has_icd10_data(patient_data):
 else:
     st.success("✅ **VA Representative Dataset** — 16 veteran profiles loaded · CFR 38 VASRD matching active · PACT Act 2022 included")
     patient_data = synthetic_patients()
-    
+
 # ── Session state ─────────────────────────────────────────────────
 if "sc_audit" not in st.session_state:
     st.session_state.sc_audit = []
@@ -290,7 +383,7 @@ with st.sidebar:
     **Matching:** Rule-based prefix logic — not validated against VA outcomes  
     **Human Review:** Required before every authorization  
     **Audit Trail:** Logged per determination  
-    """)    
+    """)
     st.markdown("---")
     st.markdown("### 🔗 Data Sources")
     st.markdown(f"""
@@ -361,7 +454,6 @@ with detail_col:
         pat = st.session_state.selected_patient
         st.markdown(f"### 🔍 {pat['name']} — SC Detail")
 
-        # Pipeline progress
         current_stage = st.session_state.patient_stages.get(pat["id"], "SC Eligibility")
         stage_idx = stages.index(current_stage) if current_stage in stages else 1
         progress = (stage_idx + 1) / len(stages)
@@ -460,7 +552,6 @@ with detail_col:
         st.markdown("### 👆 Select a veteran to review")
         st.info("Click **Review** on any veteran in the queue to open the SC classification detail and take an authorization action.")
 
-    # Audit trail
     if st.session_state.sc_audit:
         st.markdown("---")
         st.markdown("### 📝 Audit Trail (FISMA)")
@@ -486,6 +577,6 @@ with detail_col:
 st.markdown("---")
 st.caption(
     "Commence · SC/SA Revenue Utilization Review · "
-    f"FHIR R4: {'hapi.fhir.org — live' if fhir_status == 'live' else 'offline synthetic'} · "
+    f"FHIR R4: {'server.fire.ly — live' if fhir_status == 'live' else 'offline synthetic'} · "
     "CFR 38 Part 4 VASRD · PACT Act 2022 · VA RO/CPAC Industry Day · Sol. 36C10X26Q0085"
 )
