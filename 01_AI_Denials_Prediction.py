@@ -1,747 +1,792 @@
-import streamlit as st
+#!/usr/bin/env python3
+"""
+VA Demo Data Loader
+===================
+Generates synthetic veteran FHIR records using Synthea and uploads them
+to a public FHIR R4 server for the Commence VA RCM demo.
+
+Enriches Synthea output with:
+  - PACT Act presumptive condition flags
+  - VASRD diagnostic code mappings
+  - MCCF / Non-MCCF billing authority classification
+  - SC/SA indicators and veteran liability flags
+  - ICD-10 diagnosis codes injected into EOBs for varied denial risk profiles
+
+Uploads Patient resources first, captures Firely-assigned IDs, then
+rewrites all references before uploading remaining resources. Handles
+both Synthea reference formats:
+  - urn:uuid:synthea-id  →  Patient/server-id
+  - Patient/synthea-id   →  Patient/server-id
+
+Resource filters applied to keep upload fast:
+  - Only uploads Patient, Condition, ExplanationOfBenefit
+  - Only uploads EOBs created after EOB_CUTOFF_DATE (last 6 months)
+  - All other Synthea resources are skipped
+
+Usage:
+  python va_data_loader.py
+
+Intended to run:
+  - On a schedule via GitHub Actions (every 6 hours)
+  - Manually the morning of the demo (May 19, 2026)
+
+No authentication required. No VA data used. All records are synthetic.
+"""
+
 import requests
 import json
-import random
-import datetime
-import pandas as pd
+import os
+import subprocess
+import logging
+import time
+import sys
+import uuid
 from pathlib import Path
+from datetime import datetime
 
-# ── Page config ───────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Commence · AI Denials Prediction",
-    page_icon="🏥",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ── Configuration ──────────────────────────────────────────────────────────────
 
-# ── Load reference data ───────────────────────────────────────────
-DATA_DIR = Path(__file__).parent.parent / "data"
+FHIR_BASE         = "https://server.fire.ly/r4"
+SYNTHEA_PATH      = "./synthea"
+OUTPUT_PATH       = "./synthea/output/fhir"
+VETERAN_COUNT     = 10           # Number of synthetic veterans to generate
+RANDOM_SEED       = 42           # Fixed seed — overridden by GitHub Actions YAML
+STATE             = "Arizona"
+CITY              = "Phoenix"    # VISN 18 — relevant to demo location
+RETRY_COUNT       = 3            # Attempts per resource before giving up
+RETRY_DELAY       = 2            # Base seconds between retries
+RATE_LIMIT_SEC    = 0.1          # Pause between uploads
+EOB_CUTOFF_DATE   = "2025-09-01" # Only upload EOBs after this date (last 6 months)
 
-@st.cache_data
-def load_carc():
-    with open(DATA_DIR / "carc_codes.json") as f:
-        return {c["code"]: c for c in json.load(f)}
-
-CARC = load_carc()
-
-# ── FHIR helpers ──────────────────────────────────────────────────
-FHIR_BASE = "https://server.fire.ly/r4"
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_eobs(count=20):
-    """Fetch ExplanationOfBenefit resources from Firely FHIR"""
-    try:
-        r = requests.get(
-            f"{FHIR_BASE}/ExplanationOfBenefit",
-            params={"_count": count, "_sort": "-_lastUpdated", "_format": "json"},
-            timeout=8
-        )
-        if r.status_code == 200:
-            bundle  = r.json()
-            entries = bundle.get("entry", [])
-            return [e["resource"] for e in entries if "resource" in e], "live"
-    except Exception:
-        pass
-    return None, "offline"
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_patient_conditions(pat_id):
-    """
-    Fetch ICD-10 condition codes for a specific patient.
-    Used as fallback when EOB has no diagnosis codes.
-    Returns list of ICD-10 code strings.
-    """
-    try:
-        r = requests.get(
-            f"{FHIR_BASE}/Condition",
-            params={"patient": pat_id, "_count": 10, "_format": "json"},
-            timeout=5
-        )
-        if r.status_code != 200:
-            return []
-        codes = []
-        for entry in r.json().get("entry", []):
-            res = entry.get("resource", {})
-            for coding in res.get("code", {}).get("coding", []):
-                system = coding.get("system", "")
-                code   = coding.get("code", "")
-                if system.startswith("http://hl7.org/fhir/sid/icd") and code:
-                    codes.append(code)
-        return codes
-    except Exception:
-        return []
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_patients(count=20):
-    """Fetch Patient resources from Firely FHIR"""
-    try:
-        r = requests.get(
-            f"{FHIR_BASE}/Patient",
-            params={"_count": count, "_sort": "-_lastUpdated", "_format": "json"},
-            timeout=8
-        )
-        if r.status_code == 200:
-            bundle  = r.json()
-            entries = bundle.get("entry", [])
-            return {
-                e["resource"]["id"]: e["resource"]
-                for e in entries if "resource" in e
-            }, "live"
-    except Exception:
-        pass
-    return {}, "offline"
-
-# ── ICD-10 Category Denial Risk Table ────────────────────────────
-# Source: CMS Medicare denial pattern data and PEPPER reports
-# Each ICD-10 chapter maps to:
-#   base_risk  — aggregate denial rate for this diagnosis category
-#   primary_carc — most common denial reason code
-#   modifiers  — additional risk factors specific to this category
-#   reason     — plain language explanation of primary denial driver
-
-ICD10_DENIAL_RISK = {
-    # Mental Health — high prior auth denial rate
-    "F": {
-        "base_risk":    0.44,
-        "primary_carc": "197",
-        "modifiers": [
-            {"factor": "Prior auth required — mental health services",    "weight": 22, "category": "Auth"},
-            {"factor": "CARC 197: Precertification/authorization absent", "weight": 18, "category": "Auth"},
-            {"factor": "Medical necessity documentation required",         "weight": 12, "category": "Medical Necessity"},
-        ],
-        "reason": "Mental health claims require prior authorization in 44% of cases"
-    },
-    # Musculoskeletal — medical necessity documentation
-    "M": {
-        "base_risk":    0.38,
-        "primary_carc": "50",
-        "modifiers": [
-            {"factor": "CARC 50: Medical necessity not established",       "weight": 20, "category": "Medical Necessity"},
-            {"factor": "Functional limitation documentation required",     "weight": 14, "category": "Medical Necessity"},
-            {"factor": "Conservative treatment pathway not documented",    "weight": 10, "category": "Administrative"},
-        ],
-        "reason": "Musculoskeletal claims denied for medical necessity at 38% rate"
-    },
-    # Cardiovascular — COB and payer coordination
-    "I": {
-        "base_risk":    0.31,
-        "primary_carc": "22",
-        "modifiers": [
-            {"factor": "CARC 22: COB — secondary payer verification",     "weight": 18, "category": "COB"},
-            {"factor": "Coordination of benefits required",               "weight": 14, "category": "COB"},
-            {"factor": "CARC 45: Charge exceeds fee schedule",            "weight": 9,  "category": "Contractual"},
-        ],
-        "reason": "Cardiovascular claims face COB coordination issues at 31% rate"
-    },
-    # Respiratory — burn pit PACT Act complexity
-    "J": {
-        "base_risk":    0.42,
-        "primary_carc": "50",
-        "modifiers": [
-            {"factor": "CARC 50: Medical necessity — pulmonary function",  "weight": 20, "category": "Medical Necessity"},
-            {"factor": "PACT Act presumptive — SC verification required",  "weight": 16, "category": "Auth"},
-            {"factor": "CARC 167: Diagnosis not covered without SC flag",  "weight": 12, "category": "Coverage"},
-        ],
-        "reason": "Respiratory claims complex under PACT Act — denial rate 42%"
-    },
-    # Neurological — coding specificity
-    "G": {
-        "base_risk":    0.35,
-        "primary_carc": "11",
-        "modifiers": [
-            {"factor": "CARC 11: Diagnosis inconsistent with procedure",   "weight": 18, "category": "Coding"},
-            {"factor": "Specificity required — laterality not documented", "weight": 13, "category": "Coding"},
-            {"factor": "CARC 16: Claim lacks required documentation",      "weight": 10, "category": "Administrative"},
-        ],
-        "reason": "Neurological claims denied for coding specificity at 35% rate"
-    },
-    # TBI / Injury — documentation and coding
-    "S": {
-        "base_risk":    0.39,
-        "primary_carc": "11",
-        "modifiers": [
-            {"factor": "CARC 11: Diagnosis inconsistent with procedure",   "weight": 19, "category": "Coding"},
-            {"factor": "TBI — LOC duration documentation required",        "weight": 15, "category": "Administrative"},
-            {"factor": "CARC 16: Incomplete injury mechanism documentation","weight": 11, "category": "Administrative"},
-        ],
-        "reason": "TBI/injury claims require detailed documentation — 39% denial rate"
-    },
-    # Endocrine / Diabetes — Agent Orange complexity
-    "E": {
-        "base_risk":    0.28,
-        "primary_carc": "167",
-        "modifiers": [
-            {"factor": "CARC 167: Agent Orange presumptive SC verification","weight": 16, "category": "Coverage"},
-            {"factor": "CARC 177: Eligibility verification required",       "weight": 12, "category": "Eligibility"},
-            {"factor": "MCCF vs Non-MCCF classification pending SC review", "weight": 9,  "category": "Auth"},
-        ],
-        "reason": "Endocrine claims — Agent Orange presumptive adds complexity at 28%"
-    },
-    # Sensory — hearing / tinnitus high volume
-    "H": {
-        "base_risk":    0.22,
-        "primary_carc": "96",
-        "modifiers": [
-            {"factor": "CARC 96: Non-covered charge without SC rating",    "weight": 14, "category": "Coverage"},
-            {"factor": "Audiological documentation required",              "weight": 10, "category": "Administrative"},
-            {"factor": "CARC 45: Charge exceeds audiology fee schedule",   "weight": 8,  "category": "Contractual"},
-        ],
-        "reason": "Hearing/sensory claims — coverage and fee schedule issues at 22%"
-    },
-    # Cancer / Neoplasm — high value, high scrutiny
-    "C": {
-        "base_risk":    0.45,
-        "primary_carc": "197",
-        "modifiers": [
-            {"factor": "CARC 197: Oncology prior auth required",           "weight": 24, "category": "Auth"},
-            {"factor": "CARC 50: Medical necessity — treatment protocol",  "weight": 18, "category": "Medical Necessity"},
-            {"factor": "Burn pit presumptive — PACT Act SC verification",  "weight": 14, "category": "Auth"},
-        ],
-        "reason": "Cancer claims require prior auth and PACT Act review — 45% denial rate"
-    },
-    # Default — general claims
-    "DEFAULT": {
-        "base_risk":    0.25,
-        "primary_carc": "16",
-        "modifiers": [
-            {"factor": "CARC 16: Claim lacks required information",        "weight": 14, "category": "Administrative"},
-            {"factor": "CARC 29: Timely filing verification required",     "weight": 10, "category": "Administrative"},
-            {"factor": "Documentation completeness review",                "weight": 8,  "category": "Administrative"},
-        ],
-        "reason": "Standard claim — documentation completeness review"
-    }
+# Only upload resource types needed by demo pages
+UPLOAD_RESOURCE_TYPES = {
+    "Patient",
+    "Condition",
+    "ExplanationOfBenefit",
 }
 
-def get_icd10_category(eob, patient_conditions=None):
-    """
-    Extract primary ICD-10 chapter from EOB diagnosis codes.
-    Falls back to patient condition codes when EOB has no diagnoses
-    — common with Synthea pre-adjudication EOBs.
-    Returns the first character of the primary ICD-10 code (A-Z).
-    """
-    # First try EOB diagnosis array
-    for dx in eob.get("diagnosis", []):
-        code = (
-            dx.get("diagnosisCodeableConcept", {})
-              .get("coding", [{}])[0]
-              .get("code", "")
-        )
-        if code and code[0].isalpha() and code[0].upper() in ICD10_DENIAL_RISK:
-            return code[0].upper()
+LOG_FILE = f"./va_loader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    # Fall back to patient condition codes
-    if patient_conditions:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ── VA Reference Data ──────────────────────────────────────────────────────────
+
+# PACT Act presumptive conditions mapped to ICD-10 codes
+PACT_ACT_CONDITIONS = {
+    # Burn Pit / Airborne Hazard Presumptives
+    "J44.0":   {"label": "COPD with acute lower respiratory infection",  "exposure": "Burn Pit"},
+    "J44.1":   {"label": "COPD with acute exacerbation",                 "exposure": "Burn Pit"},
+    "J44.9":   {"label": "COPD unspecified",                             "exposure": "Burn Pit"},
+    "J45.20":  {"label": "Mild intermittent asthma uncomplicated",       "exposure": "Burn Pit"},
+    "J45.40":  {"label": "Moderate persistent asthma uncomplicated",     "exposure": "Burn Pit"},
+    "J45.41":  {"label": "Moderate persistent asthma with exacerbation", "exposure": "Burn Pit"},
+    "J45.50":  {"label": "Severe persistent asthma uncomplicated",       "exposure": "Burn Pit"},
+    "J68.0":   {"label": "Bronchitis due to solids and liquids",         "exposure": "Burn Pit"},
+    "J70.2":   {"label": "Acute pulmonary manifestations from radiation","exposure": "Burn Pit"},
+    "C34.10":  {"label": "Malignant neoplasm upper lobe bronchus",       "exposure": "Burn Pit"},
+    "C34.90":  {"label": "Malignant neoplasm bronchus unspecified",      "exposure": "Burn Pit"},
+    "C34.32":  {"label": "Malignant neoplasm lower lobe left bronchus",  "exposure": "Burn Pit"},
+    # Agent Orange Presumptives
+    "E11.9":   {"label": "Type 2 diabetes mellitus without compl.",      "exposure": "Agent Orange"},
+    "E11.65":  {"label": "Type 2 diabetes with hyperglycemia",           "exposure": "Agent Orange"},
+    "E11.40":  {"label": "Type 2 diabetes with neuropathy",              "exposure": "Agent Orange"},
+    "E11.51":  {"label": "Type 2 diabetes with macular edema",           "exposure": "Agent Orange"},
+    "E11.00":  {"label": "Type 2 diabetes with hyperosmolarity",         "exposure": "Agent Orange"},
+    "C82.90":  {"label": "Follicular lymphoma unspecified",              "exposure": "Agent Orange"},
+    "C91.10":  {"label": "Chronic lymphocytic leukemia",                 "exposure": "Agent Orange"},
+    "C61":     {"label": "Malignant neoplasm prostate",                  "exposure": "Agent Orange"},
+    "L40.0":   {"label": "Psoriasis vulgaris",                           "exposure": "Agent Orange"},
+    # Camp Lejeune Water Contamination Presumptives
+    "C67.9":   {"label": "Malignant neoplasm bladder unspecified",       "exposure": "Camp Lejeune"},
+    "K29.70":  {"label": "Gastritis without bleeding",                   "exposure": "Camp Lejeune"},
+    "N04.9":   {"label": "Nephrotic syndrome unspecified",               "exposure": "Camp Lejeune"},
+    # Gulf War Presumptives
+    "G89.21":  {"label": "Chronic pain due to trauma",                   "exposure": "Gulf War"},
+    "G89.29":  {"label": "Other chronic pain",                           "exposure": "Gulf War"},
+    "R53.82":  {"label": "Chronic fatigue unspecified",                  "exposure": "Gulf War"},
+    "K92.1":   {"label": "Melena",                                       "exposure": "Gulf War"},
+    # Combat / Service Related
+    "F43.10":  {"label": "PTSD unspecified",                             "exposure": "Combat"},
+    "F43.11":  {"label": "PTSD acute",                                   "exposure": "Combat"},
+    "F43.12":  {"label": "PTSD chronic",                                 "exposure": "Combat"},
+    "F43.0":   {"label": "Acute stress reaction",                        "exposure": "Combat"},
+    "S09.90":  {"label": "Unspecified injury of head",                   "exposure": "Combat TBI"},
+    "S06.0X0": {"label": "Concussion without loss of consciousness",     "exposure": "Combat TBI"},
+    "S06.0X1": {"label": "Concussion with LOC less than 30 min",         "exposure": "Combat TBI"},
+    "Z77.098": {"label": "Contact with other hazardous non-metals",      "exposure": "Burn Pit"},
+}
+
+# VASRD diagnostic code mapping
+VASRD_MAP = {
+    "F43.10":  {"code": "9411", "name": "PTSD, combat",                   "max_rating": 100},
+    "F43.11":  {"code": "9411", "name": "PTSD, combat, acute",            "max_rating": 100},
+    "F43.12":  {"code": "9411", "name": "PTSD, combat, chronic",          "max_rating": 100},
+    "F43.0":   {"code": "9411", "name": "Acute stress/PTSD",              "max_rating": 100},
+    "F32.9":   {"code": "9434", "name": "Major depressive disorder",      "max_rating": 100},
+    "F32.1":   {"code": "9434", "name": "Major depression moderate",      "max_rating": 100},
+    "F41.1":   {"code": "9400", "name": "Generalized anxiety disorder",   "max_rating": 50},
+    "F41.9":   {"code": "9400", "name": "Anxiety disorder unspecified",   "max_rating": 50},
+    "J44.1":   {"code": "6604", "name": "Asthma/COPD",                    "max_rating": 100},
+    "J44.0":   {"code": "6604", "name": "COPD with infection",            "max_rating": 100},
+    "J44.9":   {"code": "6604", "name": "COPD unspecified",               "max_rating": 100},
+    "J45.40":  {"code": "6602", "name": "Asthma moderate persistent",     "max_rating": 60},
+    "J45.41":  {"code": "6602", "name": "Asthma with exacerbation",       "max_rating": 60},
+    "S09.90":  {"code": "8045", "name": "TBI residuals",                  "max_rating": 100},
+    "S06.0X0": {"code": "8045", "name": "TBI concussion residuals",       "max_rating": 100},
+    "S06.0X1": {"code": "8045", "name": "TBI with LOC",                   "max_rating": 100},
+    "M54.5":   {"code": "5295", "name": "Lumbosacral strain",             "max_rating": 40},
+    "M54.50":  {"code": "5295", "name": "Low back pain unspecified",      "max_rating": 40},
+    "M54.4":   {"code": "5293", "name": "Intervertebral disc syndrome",   "max_rating": 60},
+    "M17.11":  {"code": "5257", "name": "Knee instability",               "max_rating": 30},
+    "M17.12":  {"code": "5257", "name": "Knee instability bilateral",     "max_rating": 30},
+    "M17.31":  {"code": "5257", "name": "Secondary knee OA",              "max_rating": 30},
+    "M75.1":   {"code": "5201", "name": "Rotator cuff syndrome",          "max_rating": 40},
+    "M79.3":   {"code": "5025", "name": "Fibromyalgia/panniculitis",      "max_rating": 40},
+    "M47.812": {"code": "5242", "name": "Cervical spondylosis",           "max_rating": 30},
+    "G43.909": {"code": "8100", "name": "Migraine",                       "max_rating": 50},
+    "G43.919": {"code": "8100", "name": "Migraine with aura",             "max_rating": 50},
+    "G43.019": {"code": "8100", "name": "Migraine intractable",           "max_rating": 50},
+    "G54.2":   {"code": "8520", "name": "Radiculopathy cervical",         "max_rating": 40},
+    "E11.9":   {"code": "7913", "name": "Diabetes mellitus type 2",       "max_rating": 100},
+    "E11.65":  {"code": "7913", "name": "Diabetes type 2 hyperglycemia",  "max_rating": 100},
+    "E11.40":  {"code": "7913", "name": "Diabetes type 2 neuropathy",     "max_rating": 100},
+    "E10.9":   {"code": "7913", "name": "Diabetes mellitus type 1",       "max_rating": 100},
+    "H91.90":  {"code": "6100", "name": "Hearing loss bilateral",         "max_rating": 100},
+    "H90.3":   {"code": "6100", "name": "Sensorineural hearing loss",     "max_rating": 100},
+    "H90.6":   {"code": "6100", "name": "Hearing loss bilateral mixed",   "max_rating": 100},
+    "H83.01":  {"code": "6260", "name": "Tinnitus right ear",             "max_rating": 10},
+    "H83.09":  {"code": "6260", "name": "Tinnitus unspecified",           "max_rating": 10},
+    "C34.10":  {"code": "6819", "name": "Malignant neoplasm respiratory", "max_rating": 100},
+    "C34.90":  {"code": "6819", "name": "Lung cancer unspecified",        "max_rating": 100},
+    "C61":     {"code": "7528", "name": "Malignant neoplasm prostate",    "max_rating": 100},
+    "I10":     {"code": "7101", "name": "Hypertensive vascular disease",  "max_rating": 60},
+    "I25.10":  {"code": "7005", "name": "Ischemic heart disease",         "max_rating": 100},
+    "I50.9":   {"code": "7007", "name": "Heart failure unspecified",      "max_rating": 100},
+    "L40.0":   {"code": "7816", "name": "Psoriasis",                      "max_rating": 60},
+    "F10.20":  {"code": "9201", "name": "Alcohol use disorder",           "max_rating": 70},
+    "G89.21":  {"code": "8025", "name": "Chronic pain syndrome",          "max_rating": 50},
+    "G35":     {"code": "8018", "name": "Multiple sclerosis",             "max_rating": 100},
+}
+
+# Billing authority references
+MCCF_AUTHORITY     = "38 USC 1729"
+NON_MCCF_AUTHORITY = "38 USC 1722A / PACT Act PL 117-168"
+
+# ── Step 1: Generate Synthea Data ──────────────────────────────────────────────
+
+def generate_synthea_data():
+    """
+    Run Synthea to generate a synthetic veteran population.
+    Skipped automatically when running in GitHub Actions.
+    """
+
+    synthea_dir = Path(SYNTHEA_PATH)
+
+    if not synthea_dir.exists():
+        log.error(f"Synthea not found at {SYNTHEA_PATH}")
+        return False
+
+    run_script = synthea_dir / "run_synthea"
+    if not run_script.exists():
+        log.error("run_synthea script not found")
+        return False
+
+    output_dir = Path(OUTPUT_PATH)
+    if output_dir.exists():
+        removed = 0
+        for f in output_dir.glob("*.json"):
+            f.unlink()
+            removed += 1
+        log.info(f"Cleared {removed} previous Synthea output files")
+
+    log.info(f"Generating {VETERAN_COUNT} veteran records for {CITY}, {STATE}...")
+
+    cmd = [
+        str(run_script),
+        "-p", str(VETERAN_COUNT),
+        "-s", str(RANDOM_SEED),
+        "--exporter.fhir.export", "true",
+        "--exporter.fhir.us_core_version", "4.0.0",
+        "--exporter.hospital.fhir.export", "false",
+        "--exporter.practitioner.fhir.export", "false",
+        "--exporter.fhir.bulk_data", "false",
+        STATE, CITY
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(synthea_dir),
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            log.error(f"Synthea exited with code {result.returncode}")
+            log.error(result.stderr[-2000:])
+            return False
+
+        files = list(Path(OUTPUT_PATH).glob("*.json"))
+        log.info(f"Synthea generated {len(files)} FHIR bundle files")
+        return len(files) > 0
+
+    except subprocess.TimeoutExpired:
+        log.error("Synthea timed out after 5 minutes")
+        return False
+    except FileNotFoundError:
+        log.error("Could not execute run_synthea — check permissions")
+        return False
+
+# ── Step 2: Enrich With VA-Specific Extensions ─────────────────────────────────
+
+def classify_mccf_status(icd_codes):
+    """Determine MCCF vs Non-MCCF billing classification."""
+
+    pact_matches = [c for c in icd_codes if c in PACT_ACT_CONDITIONS]
+    is_pact      = len(pact_matches) > 0
+
+    if is_pact:
+        exposure = PACT_ACT_CONDITIONS[pact_matches[0]]["exposure"]
+        return {
+            "mccfStatus":          "NON-MCCF",
+            "billingAuthority":    NON_MCCF_AUTHORITY,
+            "veteranLiability":    False,
+            "requiresSCReview":    True,
+            "classificationBasis": f"PACT Act presumptive — {exposure} exposure",
+            "humanReviewRequired": True,
+        }
+    else:
+        return {
+            "mccfStatus":          "MCCF",
+            "billingAuthority":    MCCF_AUTHORITY,
+            "veteranLiability":    True,
+            "requiresSCReview":    False,
+            "classificationBasis": "Standard third-party OHI billing",
+            "humanReviewRequired": False,
+        }
+
+def enrich_condition(resource):
+    """Add PACT Act and VASRD extensions to a Condition resource."""
+
+    icd_codes  = [
+        c.get("code", "")
+        for c in resource.get("code", {}).get("coding", [])
+        if "icd" in c.get("system", "").lower()
+    ]
+    extensions = resource.get("extension", [])
+
+    for code in icd_codes:
+        if code in PACT_ACT_CONDITIONS:
+            pact_info = PACT_ACT_CONDITIONS[code]
+            extensions.append({
+                "url": "http://va.gov/fhir/StructureDefinition/pact-act-presumptive",
+                "extension": [
+                    {"url": "isPACTActPresumptive",  "valueBoolean": True},
+                    {"url": "presumptiveLabel",       "valueString":  pact_info["label"]},
+                    {"url": "exposureCategory",       "valueString":  pact_info["exposure"]},
+                    {"url": "statutoryAuthority",     "valueString":  "PL 117-168"},
+                    {"url": "requiresSCVerification", "valueBoolean": True},
+                    {"url": "humanReviewFlag",        "valueBoolean": True},
+                ]
+            })
+
+        if code in VASRD_MAP:
+            vasrd_info = VASRD_MAP[code]
+            extensions.append({
+                "url": "http://va.gov/fhir/StructureDefinition/vasrd-mapping",
+                "extension": [
+                    {"url": "vasrdDiagnosticCode", "valueString":  vasrd_info["code"]},
+                    {"url": "conditionName",        "valueString":  vasrd_info["name"]},
+                    {"url": "maximumRating",        "valueInteger": vasrd_info["max_rating"]},
+                    {"url": "regulatoryReference",  "valueString":  "38 CFR Part 4"},
+                ]
+            })
+
+    resource["extension"] = extensions
+    return resource
+
+def enrich_eob(resource, patient_conditions):
+    """
+    Add MCCF classification, denial risk context, and ensure
+    ICD-10 diagnosis codes are present in EOB diagnosis array.
+
+    Synthea EOBs frequently have empty or SNOMED-only diagnosis arrays.
+    This function injects the patient's ICD-10 condition codes into
+    the EOB diagnosis array so the Streamlit denials page
+    get_icd10_category() function can determine the correct
+    CMS denial risk profile — producing varied High/Medium/Low
+    risk scores rather than everything defaulting to LOW RISK.
+    """
+
+    # ── Inject ICD-10 diagnoses if EOB diagnosis array is empty ──
+    existing_dx = resource.get("diagnosis", [])
+    existing_codes = [
+        d.get("diagnosisCodeableConcept", {})
+         .get("coding", [{}])[0]
+         .get("code", "")
+        for d in existing_dx
+    ]
+
+    # Check if any existing codes are ICD-10 (alpha first char)
+    has_icd10 = any(
+        c and c[0].isalpha()
+        for c in existing_codes
+        if c
+    )
+
+    if not has_icd10 and patient_conditions:
+        # Inject up to 3 patient ICD-10 conditions into EOB diagnosis
+        injected = []
+        seen     = set()
         for code in patient_conditions:
-            if code and code[0].isalpha() and code[0].upper() in ICD10_DENIAL_RISK:
-                return code[0].upper()
+            if code and code not in seen and len(injected) < 3:
+                injected.append({
+                    "sequence": len(existing_dx) + len(injected) + 1,
+                    "diagnosisCodeableConcept": {
+                        "coding": [{
+                            "system":  "http://hl7.org/fhir/sid/icd-10-cm",
+                            "code":    code,
+                            "display": "Condition from patient record"
+                        }]
+                    },
+                    "type": [{
+                        "coding": [{
+                            "system": "http://terminology.hl7.org/CodeSystem/ex-diagnosistype",
+                            "code":   "principal"
+                        }]
+                    }]
+                })
+                seen.add(code)
+
+        if injected:
+            resource["diagnosis"] = existing_dx + injected
+            log.info(f"    Injected {len(injected)} ICD-10 dx codes into EOB")
+
+    # ── MCCF classification ───────────────────────────────────────
+    eob_icd_codes = [
+        d.get("diagnosisCodeableConcept", {})
+         .get("coding", [{}])[0]
+         .get("code", "")
+        for d in resource.get("diagnosis", [])
+    ]
+
+    all_codes = list(set(eob_icd_codes + patient_conditions))
+    mccf      = classify_mccf_status(all_codes)
+
+    denial_factors = []
+    if mccf["requiresSCReview"]:
+        denial_factors.append("PACT Act SC status unverified")
+    if any(c in PACT_ACT_CONDITIONS for c in all_codes):
+        denial_factors.append("Presumptive condition — billing authority ambiguous")
+
+    extensions = resource.get("extension", [])
+    extensions.append({
+        "url": "http://va.gov/fhir/StructureDefinition/va-billing-context",
+        "extension": [
+            {"url": "mccfStatus",          "valueString":  mccf["mccfStatus"]},
+            {"url": "billingAuthority",     "valueString":  mccf["billingAuthority"]},
+            {"url": "veteranLiability",     "valueBoolean": mccf["veteranLiability"]},
+            {"url": "classificationBasis",  "valueString":  mccf["classificationBasis"]},
+            {"url": "humanReviewRequired",  "valueBoolean": mccf["humanReviewRequired"]},
+            {"url": "denialRiskFactors",    "valueString":  "; ".join(denial_factors) if denial_factors else "None identified"},
+            {"url": "modelVersion",         "valueString":  "commence-va-demo-v1.0"},
+            {"url": "modelDataSource",      "valueString":  "Synthea synthetic veteran population — no real VA data"},
+            {"url": "scoringMethod",        "valueString":  "Simulated — architectural demonstration only"},
+        ]
+    })
+
+    resource["extension"] = extensions
+    return resource
+
+def enrich_bundle(bundle):
+    """
+    Walk a Synthea FHIR bundle and enrich all relevant resources
+    with VA-specific billing, PACT Act, VASRD, and denial risk context.
+    """
+
+    # First pass — collect patient ICD-10 condition codes
+    patient_conditions = []
+    for entry in bundle.get("entry", []):
+        resource = entry.get("resource", {})
+        if resource.get("resourceType") == "Condition":
+            codes = [
+                c.get("code", "")
+                for c in resource.get("code", {}).get("coding", [])
+                if "icd" in c.get("system", "").lower()
+            ]
+            patient_conditions.extend(codes)
+
+    # Second pass — enrich resources
+    for entry in bundle.get("entry", []):
+        resource = entry.get("resource", {})
+        rtype    = resource.get("resourceType")
+
+        if rtype == "Condition":
+            entry["resource"] = enrich_condition(resource)
+        elif rtype == "ExplanationOfBenefit":
+            entry["resource"] = enrich_eob(resource, patient_conditions)
+
+    return bundle
+
+# ── Step 3: Upload With Referential Integrity ──────────────────────────────────
+
+def upload_resource(resource, rtype):
+    """
+    Upload a single FHIR resource via POST.
+    Returns server-assigned ID on success, None on failure.
+    """
+
+    url = f"{FHIR_BASE}/{rtype}"
+
+    for attempt in range(1, RETRY_COUNT + 1):
+        try:
+            response = requests.post(
+                url,
+                json=resource,
+                headers={"Content-Type": "application/fhir+json"},
+                timeout=30
+            )
+
+            if response.status_code in [200, 201]:
+                server_id = response.json().get("id")
+                log.info(f"    → {rtype}/{server_id}")
+                return server_id
+            else:
+                log.warning(
+                    f"  {rtype} attempt {attempt}/{RETRY_COUNT} "
+                    f"HTTP {response.status_code}"
+                )
+                if attempt < RETRY_COUNT:
+                    time.sleep(RETRY_DELAY ** attempt)
+
+        except requests.exceptions.Timeout:
+            log.warning(f"  {rtype} timeout attempt {attempt}/{RETRY_COUNT}")
+            if attempt < RETRY_COUNT:
+                time.sleep(RETRY_DELAY ** attempt)
+
+        except requests.exceptions.ConnectionError as e:
+            log.error(f"Connection error: {e}")
+            return None
 
     return None
 
-# ── Denial scoring engine ─────────────────────────────────────────
-def score_claim(eob, patient_data, patient_conditions=None):
+def upload_patients_first(bundle):
     """
-    Score a claim for denial risk using:
-
-    1. Real CARC codes from EOB adjudication (when present)
-    2. ICD-10 category denial rate patterns from CMS Medicare data
-       First tries EOB diagnosis codes, then falls back to patient
-       condition codes fetched separately from FHIR — ensuring
-       meaningful risk categorization for pre-adjudication claims.
-
-    This replaces arbitrary hash-based scoring with denial rates
-    grounded in CMS Medicare denial pattern data and PEPPER reports.
+    Upload Patient resources first and capture
+    Synthea ID → server ID mapping for referential integrity.
     """
-    score   = 0
-    factors = []
+    id_map = {}
 
-    # ── Path 1: Real CARC codes in EOB ───────────────────────────
-    carc_codes_found = []
-    for item in eob.get("item", []):
-        for adj in item.get("adjudication", []):
-            reason = adj.get("reason", {})
-            code   = reason.get("coding", [{}])[0].get("code", "")
-            if code in CARC:
-                carc_codes_found.append(code)
+    for entry in bundle.get("entry", []):
+        resource = entry.get("resource", {})
+        if resource.get("resourceType") != "Patient":
+            continue
 
-    for item in eob.get("adjudication", []):
-        reason = item.get("reason", {})
-        code   = reason.get("coding", [{}])[0].get("code", "")
-        if code in CARC:
-            carc_codes_found.append(code)
+        synthea_id = resource.get("id")
+        if not synthea_id:
+            continue
 
-    for code in set(carc_codes_found):
-        c            = CARC[code]
-        contribution = int(c["denial_rate"] * 60)
-        score       += contribution
-        factors.append({
-            "factor":   f"CARC {code}: {c['description'][:45]}",
-            "weight":   contribution,
-            "category": c["category"]
-        })
+        server_id = upload_resource(resource, "Patient")
 
-    # ── Path 2: ICD-10 category denial rates (no CARC codes) ─────
-    if not factors:
-        icd_category = get_icd10_category(eob, patient_conditions)
-        risk_profile = ICD10_DENIAL_RISK.get(
-            icd_category,
-            ICD10_DENIAL_RISK["DEFAULT"]
-        )
+        if server_id:
+            id_map[synthea_id] = server_id
+            log.info(f"  Patient {synthea_id} → server ID {server_id}")
+        else:
+            log.warning(f"  Patient {synthea_id} failed to upload")
 
-        # Rescale CMS denial rates to meaningful risk tiers
-        # Maps 0.20-0.45 denial rate range to 35-85 score range
-        # So 44% mental health denial rate scores 83 (High Risk)
-        # rather than 44 which incorrectly shows as Low Risk
-        base_score = int(35 + (risk_profile["base_risk"] - 0.20) * (85 - 35) / (0.45 - 0.20))
-        base_score = max(35, min(85, base_score))
+        time.sleep(RATE_LIMIT_SEC)
 
-        # Add claim value modifier
-        total_amount = 0
-        for item in eob.get("item", []):
-            amt = item.get("adjudication", [{}])[0].get("amount", {}).get("value", 0)
-            total_amount += float(amt or 0)
-        if total_amount == 0:
-            payment = eob.get("payment", {}).get("amount", {}).get("value", 0)
-            total_amount = float(payment or 0)
+    log.info(f"  Captured {len(id_map)} patient ID mappings")
+    return id_map
 
-        value_modifier = 0
-        if total_amount > 10000:
-            value_modifier = 12
-            factors.append({
-                "factor":   "High-value claim (>$10K) — elevated scrutiny",
-                "weight":   12,
-                "category": "Risk"
-            })
-        elif total_amount > 5000:
-            value_modifier = 7
-            factors.append({
-                "factor":   "Elevated claim value (>$5K)",
-                "weight":   7,
-                "category": "Risk"
-            })
-
-        # Add care team documentation modifier
-        if not eob.get("careTeam", []):
-            value_modifier += 8
-            factors.append({
-                "factor":   "Missing care team documentation",
-                "weight":   8,
-                "category": "Administrative"
-            })
-
-        score = min(base_score + value_modifier, 98)
-
-        # Add ICD-10 category specific factors
-        for mod in risk_profile["modifiers"][:3]:
-            factors.append(mod)
-
-    # ── Claim amount extraction ───────────────────────────────────
-    total_amount = 0
-    for item in eob.get("item", []):
-        amt = item.get("adjudication", [{}])[0].get("amount", {}).get("value", 0)
-        total_amount += float(amt or 0)
-    if total_amount == 0:
-        payment = eob.get("payment", {}).get("amount", {}).get("value", 0)
-        total_amount = float(payment or 0)
-
-    payer_display = eob.get("insurer", {}).get("display", "Unknown")
-
-    score   = min(score, 98)
-    factors = sorted(factors, key=lambda x: -x["weight"])[:5]
-
-    return score, factors, total_amount, payer_display
-
-# ── Synthetic fallback data ───────────────────────────────────────
-def synthetic_claims():
+def rewrite_references(resource, id_map):
     """
-    Fallback claims when FHIR server unavailable.
-    Scores driven by ICD-10 category denial rates — not random.
-    """
-    payers   = ["Aetna", "UnitedHealthcare", "TRICARE", "VA OHI", "Cigna", "Humana", "BCBS"]
-    types    = ["Veteran/SC", "OHI Patient", "TRICARE", "Non-Veteran", "Dual Eligible"]
-    services = ["Inpatient", "Outpatient", "Emergency", "Mental Health", "Surgery", "Radiology"]
+    Recursively rewrite Patient references throughout a resource.
 
-    # Representative veteran claim scenarios with ICD-10 categories
-    scenarios = [
-        {"icd_cat": "F", "service": "Mental Health", "amount": 3400},
-        {"icd_cat": "M", "service": "Outpatient",    "amount": 2800},
-        {"icd_cat": "I", "service": "Inpatient",     "amount": 18400},
-        {"icd_cat": "J", "service": "Emergency",     "amount": 5600},
-        {"icd_cat": "S", "service": "Emergency",     "amount": 7800},
-        {"icd_cat": "G", "service": "Outpatient",    "amount": 4200},
-        {"icd_cat": "E", "service": "Outpatient",    "amount": 1240},
-        {"icd_cat": "H", "service": "Outpatient",    "amount": 890},
-        {"icd_cat": "C", "service": "Surgery",       "amount": 24600},
-        {"icd_cat": "F", "service": "Mental Health", "amount": 11200},
-        {"icd_cat": "M", "service": "Surgery",       "amount": 15800},
-        {"icd_cat": "I", "service": "Radiology",     "amount": 23200},
-        {"icd_cat": "J", "service": "Inpatient",     "amount": 19400},
-        {"icd_cat": "S", "service": "Emergency",     "amount": 8900},
-        {"icd_cat": "G", "service": "Outpatient",    "amount": 3100},
-        {"icd_cat": "E", "service": "Outpatient",    "amount": 2200},
-        {"icd_cat": "C", "service": "Surgery",       "amount": 31200},
-        {"icd_cat": "M", "service": "Outpatient",    "amount": 1800},
+    Handles both Synthea reference formats:
+      urn:uuid:synthea-id  →  Patient/server-id
+      Patient/synthea-id   →  Patient/server-id
+    """
+    if isinstance(resource, dict):
+        for key, value in resource.items():
+            if key == "reference" and isinstance(value, str):
+                for synthea_id, server_id in id_map.items():
+                    if synthea_id in value:
+                        if value.startswith("urn:uuid:"):
+                            resource[key] = f"Patient/{server_id}"
+                        else:
+                            resource[key] = value.replace(synthea_id, server_id)
+                        break
+            else:
+                rewrite_references(value, id_map)
+    elif isinstance(resource, list):
+        for item in resource:
+            rewrite_references(item, id_map)
+    return resource
+
+def upload_bundle(filepath):
+    """
+    Load, enrich, and upload relevant resources from a Synthea bundle.
+
+    Filters:
+      1. Only Patient, Condition, ExplanationOfBenefit
+      2. EOBs only if created after EOB_CUTOFF_DATE
+
+    Upload order:
+      1. Patients first — captures ID mapping
+      2. Conditions and recent EOBs — with references rewritten
+    """
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        log.error(f"Could not read {filepath.name}: {e}")
+        return False
+
+    if not bundle.get("entry"):
+        log.warning(f"Skipping {filepath.name} — no entries")
+        return True
+
+    bundle  = enrich_bundle(bundle)
+    entries = bundle.get("entry", [])
+
+    # Check if bundle has any relevant resources
+    relevant = [
+        e for e in entries
+        if e.get("resource", {}).get("resourceType") in UPLOAD_RESOURCE_TYPES
     ]
+    if not relevant:
+        log.info(f"  Skipping {filepath.name} — no relevant resource types")
+        return True
 
-    claims = []
-    random.seed(42)
-    for i, scenario in enumerate(scenarios):
-        risk    = ICD10_DENIAL_RISK.get(scenario["icd_cat"], ICD10_DENIAL_RISK["DEFAULT"])
-        amount  = scenario["amount"]
+    # Step A — Upload patients first, capture ID mapping
+    id_map = upload_patients_first(bundle)
 
-        # Rescale CMS denial rates to meaningful risk tiers
-        # Same formula as score_claim for consistent behavior
-        base_score     = int(35 + (risk["base_risk"] - 0.20) * (85 - 35) / (0.45 - 0.20))
-        base_score     = max(35, min(85, base_score))
-        value_modifier = 12 if amount > 10000 else 7 if amount > 5000 else 0
-        score          = min(base_score + value_modifier, 98)
+    # Step B — Upload Conditions and recent EOBs
+    success = 0
+    failed  = 0
+    skipped = 0
 
-        factors = list(risk["modifiers"][:3])
-        if value_modifier > 0:
-            factors.append({
-                "factor":   f"High-value claim (${amount:,})",
-                "weight":   value_modifier,
-                "category": "Risk"
-            })
-        factors = sorted(factors, key=lambda x: -x["weight"])
+    for entry in entries:
+        resource = entry.get("resource", {})
+        rtype    = resource.get("resourceType")
 
-        seed_val = i * 137 + 42
-        random.seed(seed_val)
-        claims.append({
-            "id":        f"CLM-{7200+i:06X}",
-            "patient":   f"Veteran {chr(65+i)}.",
-            "payer":     payers[i % len(payers)],
-            "type":      types[i % len(types)],
-            "service":   scenario["service"],
-            "amount":    amount,
-            "score":     score,
-            "factors":   factors,
-            "icd_cat":   scenario["icd_cat"],
-            "status":    "Pending Review",
-            "submitted": (datetime.date.today() - datetime.timedelta(days=(i % 14)+1)).isoformat()
-        })
+        if not rtype:
+            skipped += 1
+            continue
 
-    random.seed()
-    return claims
+        # Skip patients — already uploaded in Step A
+        if rtype == "Patient":
+            continue
 
-# ── Styling ───────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .main { background: #F8F6FF; }
-    .stApp > header { background: transparent; }
-    .metric-card {
-        background: white;
-        border-radius: 8px;
-        padding: 16px 20px;
-        border-left: 4px solid #7256F6;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-        margin-bottom: 8px;
-    }
-    .claim-high { border-left: 4px solid #FF5C6B !important; }
-    .claim-med  { border-left: 4px solid #F59E0B !important; }
-    .claim-low  { border-left: 4px solid #22C55E !important; }
-    .badge-high { background:#FF5C6B22; color:#CC1122; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .badge-med  { background:#F59E0B22; color:#B45309; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .badge-low  { background:#22C55E22; color:#15803D; padding:2px 8px; border-radius:12px; font-size:12px; font-weight:bold; }
-    .fhir-tag   { background:#7256F622; color:#4F35C2; padding:2px 8px; border-radius:12px; font-size:11px; }
-    .audit-entry { background:#F0EEFB; border-radius:6px; padding:8px 12px; margin:4px 0; font-size:13px; }
-    h1 { color: #190C38 !important; }
-    h2, h3 { color: #190C38 !important; }
-</style>
-""", unsafe_allow_html=True)
+        # Skip resource types not needed by demo pages
+        if rtype not in UPLOAD_RESOURCE_TYPES:
+            skipped += 1
+            continue
 
-# ── Header ────────────────────────────────────────────────────────
-col_logo, col_title, col_status = st.columns([1, 5, 2])
-with col_logo:
-    st.markdown("### 🏥")
-with col_title:
-    st.markdown("## Commence · AI Denials Prediction Dashboard")
-    st.caption("VA Revenue Operations / CPAC — Claim Denial Risk Scoring")
+        # For EOBs skip anything older than cutoff date
+        if rtype == "ExplanationOfBenefit":
+            created = resource.get("created", "")
+            if created and created < EOB_CUTOFF_DATE:
+                skipped += 1
+                continue
 
-# ── Load data ─────────────────────────────────────────────────────
-with st.spinner("Loading claims from FHIR server..."):
-    eobs, fhir_status = fetch_eobs(20)
-    patients, _       = fetch_patients(20)
+        # Rewrite patient references — handles urn:uuid and Patient/ formats
+        if id_map:
+            resource = rewrite_references(resource, id_map)
 
-if fhir_status == "live" and eobs:
-    st.success(f"✅ **FHIR R4 Live** — {len(eobs)} claims loaded from server.fire.ly · Same spec as Oracle/Cerner Millennium")
-    use_live = True
-else:
-    st.info("📦 **Offline Mode** — Loading pre-populated VA representative claims · FHIR server unavailable")
-    use_live = False
+        server_id = upload_resource(resource, rtype)
+        if server_id is not None:
+            success += 1
+        else:
+            failed += 1
 
-# ── Build claim list ──────────────────────────────────────────────
-if use_live:
-    claims = []
-    for i, eob in enumerate(eobs[:18]):
-        eob_id  = eob.get("id", f"EOB-{i:04d}")
-        pat_ref = eob.get("patient", {}).get("reference", "")
-        pat_id  = pat_ref.split("/")[-1] if pat_ref else ""
-        patient = patients.get(pat_id, {})
+        time.sleep(RATE_LIMIT_SEC)
 
-        # Fetch patient conditions for ICD-10 category fallback
-        pat_conditions = fetch_patient_conditions(pat_id) if pat_id else []
+    log.info(
+        f"  {filepath.name} — "
+        f"{success} uploaded, {failed} failed, {skipped} skipped"
+    )
+    return failed == 0
 
-        score, factors, amount, payer = score_claim(eob, patients, pat_conditions)
+def upload_all_bundles():
+    """Upload filtered resources from all Synthea FHIR bundle files."""
 
-        given  = patient.get("name", [{}])[0].get("given",  ["Veteran"])[0] if patient else "Veteran"
-        family = patient.get("name", [{}])[0].get("family", chr(65+i))      if patient else chr(65+i)
+    output_dir = Path(OUTPUT_PATH)
 
-        payers_list   = ["Aetna","UnitedHealthcare","TRICARE","VA OHI","Cigna","BCBS","Humana"]
-        types_list    = ["Veteran/SC","OHI Patient","TRICARE","Non-Veteran","Dual Eligible"]
-        services_list = ["Inpatient","Outpatient","Emergency","Mental Health","Surgery","Radiology"]
-        h = sum(ord(c) for c in eob_id)
+    if not output_dir.exists():
+        log.error(f"Output directory not found: {OUTPUT_PATH}")
+        return 0, 0
 
-        # Determine ICD-10 category for caption display
-        icd_cat = get_icd10_category(eob, pat_conditions) or "DEFAULT"
+    fhir_files = sorted(output_dir.glob("*.json"))
 
-        claims.append({
-            "id":        f"CLM-{eob_id[-6:].upper()}",
-            "patient":   f"{given} {family[0]}.",
-            "payer":     payer if payer != "Unknown" else payers_list[h % len(payers_list)],
-            "type":      types_list[h % len(types_list)],
-            "service":   services_list[(h//3) % len(services_list)],
-            "amount":    amount,
-            "score":     score,
-            "factors":   factors,
-            "icd_cat":   icd_cat,
-            "status":    "Pending Review",
-            "submitted": (datetime.date.today() - datetime.timedelta(days=(h % 14)+1)).isoformat(),
-            "fhir_id":   eob_id
-        })
-else:
-    claims = synthetic_claims()
+    if not fhir_files:
+        log.error(f"No FHIR JSON files found in {OUTPUT_PATH}")
+        return 0, 0
 
-# ── Session state ─────────────────────────────────────────────────
-if "audit_log"      not in st.session_state: st.session_state.audit_log      = []
-if "claim_statuses" not in st.session_state: st.session_state.claim_statuses = {}
-if "selected_claim" not in st.session_state: st.session_state.selected_claim = None
+    log.info(f"Uploading {len(fhir_files)} bundles to {FHIR_BASE}")
+    log.info(f"Resource filter  : {', '.join(sorted(UPLOAD_RESOURCE_TYPES))}")
+    log.info(f"EOB cutoff date  : {EOB_CUTOFF_DATE} (last 6 months only)")
+    log.info(f"ICD-10 injection : Enabled — varied denial risk profiles")
+    log.info("-" * 60)
 
-# ── Sidebar filters ───────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🔍 Filters")
-    risk_filter    = st.selectbox("Risk Tier", ["All", "High (≥80)", "Medium (50–79)", "Low (<50)"])
-    payer_options  = ["All"] + sorted(list(set(c["payer"]    for c in claims)))
-    payer_filter   = st.selectbox("Payer", payer_options)
-    service_options= ["All"] + sorted(list(set(c["service"]  for c in claims)))
-    service_filter = st.selectbox("Service Line", service_options)
+    success = 0
+    failed  = 0
 
-    st.markdown("---")
-    st.markdown("### 📊 Model Card")
-    st.markdown("""
-    **Scoring Approach:** ICD-10 category denial rates  
-    **Data Source:** CMS Medicare denial patterns / PEPPER  
-    **Method:** Rule-based — precedent not ML training  
-    **Basis:** Real CMS denial rates by diagnosis category  
-    **CARC/RARC:** Applied when present in adjudicated claims  
-    **Human Review:** Required ≥70 score  
-    **Production:** Replaces with trained model on VA claims data  
-    **Governance:** FISMA compliant · Audit trail maintained  
-    """)
+    for filepath in fhir_files:
+        if upload_bundle(filepath):
+            success += 1
+        else:
+            failed += 1
 
-    st.markdown("---")
-    st.markdown("### 🔗 Architecture")
-    st.markdown(f"""
-    **FHIR Endpoint:**  
-    `server.fire.ly/r4`  
-    *(Cerner Millennium spec)*  
-    **Denial Data:** CMS CARC/RARC  
-    **Status:** {'🟢 Live' if use_live else '🟡 Offline fallback'}
-    """)
+    return success, failed
 
-# ── Apply filters ─────────────────────────────────────────────────
-filtered = claims.copy()
-if risk_filter == "High (≥80)":
-    filtered = [c for c in filtered if c["score"] >= 80]
-elif risk_filter == "Medium (50–79)":
-    filtered = [c for c in filtered if 50 <= c["score"] < 80]
-elif risk_filter == "Low (<50)":
-    filtered = [c for c in filtered if c["score"] < 50]
-if payer_filter != "All":
-    filtered = [c for c in filtered if c["payer"] == payer_filter]
-if service_filter != "All":
-    filtered = [c for c in filtered if c["service"] == service_filter]
+# ── Step 4: Verify ─────────────────────────────────────────────────────────────
 
-# ── KPI row ───────────────────────────────────────────────────────
-high          = sum(1 for c in filtered if c["score"] >= 80)
-med           = sum(1 for c in filtered if 50 <= c["score"] < 80)
-low           = sum(1 for c in filtered if c["score"] < 50)
-total_at_risk = sum(c["amount"] for c in filtered if c["score"] >= 70)
+def verify_upload():
+    """
+    Confirm resources are accessible and verify
+    patient-condition linkage is working correctly.
+    """
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Claims in Queue",   len(filtered), f"{len(filtered)-len(claims)} filtered" if len(filtered) < len(claims) else "unfiltered")
-k2.metric("High Risk (≥80)",   high)
-k3.metric("Medium Risk (50–79)",med)
-k4.metric("Revenue at Risk",   f"${total_at_risk:,.0f}")
+    log.info("-" * 60)
+    log.info("Verifying data accessibility on FHIR server...")
 
-st.markdown("---")
+    all_ok     = True
+    patient_id = None
 
-# ── Main layout ───────────────────────────────────────────────────
-left_col, right_col = st.columns([3, 2])
-
-with left_col:
-    st.markdown("### 📋 Claim Queue")
-    sorted_claims = sorted(filtered, key=lambda x: -x["score"])
-
-    for claim in sorted_claims:
-        current_status = st.session_state.claim_statuses.get(claim["id"], claim["status"])
-        score          = claim["score"]
-        tier           = "high" if score >= 80 else "med" if score >= 50 else "low"
-        tier_label     = "HIGH RISK" if score >= 80 else "MED RISK" if score >= 50 else "LOW RISK"
-        bar_color      = "#FF5C6B" if score >= 80 else "#F59E0B" if score >= 50 else "#22C55E"
-
-        with st.container():
-            cols = st.columns([2, 1.5, 1.5, 1, 1.5, 1])
-            with cols[0]:
-                st.markdown(f"**{claim['id']}**  \n`{claim['patient']}`")
-            with cols[1]:
-                st.markdown(f"{claim['payer']}  \n*{claim['type']}*")
-            with cols[2]:
-                st.markdown(f"**${claim['amount']:,}**  \n{claim['service']}")
-            with cols[3]:
-                st.markdown(f"<span class='badge-{tier}'>{tier_label}</span>", unsafe_allow_html=True)
-                st.progress(score / 100)
-                st.caption(f"Score: {score}")
-            with cols[4]:
-                if current_status != "Pending Review":
-                    st.success(f"✅ {current_status}")
-                elif st.button("Select", key=f"sel_{claim['id']}"):
-                    st.session_state.selected_claim = claim
-                    st.rerun()
-            with cols[5]:
-                if claim.get("fhir_id"):
-                    st.markdown("<span class='fhir-tag'>FHIR</span>", unsafe_allow_html=True)
-
-        st.divider()
-
-with right_col:
-    if st.session_state.selected_claim:
-        claim     = st.session_state.selected_claim
-        score     = claim["score"]
-        tier      = "high" if score >= 80 else "med" if score >= 50 else "low"
-        bar_color = "#FF5C6B" if score >= 80 else "#F59E0B" if score >= 50 else "#22C55E"
-
-        st.markdown(f"### 🔍 {claim['id']} — Explainability")
-        st.markdown(f"**Patient:** {claim['patient']}  |  **Score:** {score}/100")
-
-        # Score gauge
-        st.markdown(
-            f"<div style='background:#f0f0f0; border-radius:8px; height:20px; margin:8px 0;'>"
-            f"<div style='background:{bar_color}; width:{score}%; height:20px; border-radius:8px; "
-            f"display:flex; align-items:center; justify-content:flex-end; padding-right:8px; "
-            f"color:white; font-weight:bold; font-size:13px;'>{score}</div>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-        # Scoring basis note
-        icd_cat      = claim.get("icd_cat", "")
-        risk_profile = ICD10_DENIAL_RISK.get(icd_cat, ICD10_DENIAL_RISK["DEFAULT"])
-        st.caption(f"📊 {risk_profile['reason']}")
-
-        st.markdown("**Top Risk Factors (CMS CARC/RARC denial patterns)**")
-        for f in claim["factors"][:5]:
-            w     = f["weight"]
-            bar_w = min(int(w * 2.5), 100)
-            st.markdown(
-                f"<div style='margin:6px 0;'>"
-                f"<div style='font-size:12px; color:#444; margin-bottom:2px;'>{f['factor']}</div>"
-                f"<div style='display:flex; align-items:center; gap:8px;'>"
-                f"<div style='background:#e0e0e0; border-radius:4px; flex:1; height:12px;'>"
-                f"<div style='background:#7256F6; width:{bar_w}%; height:12px; border-radius:4px;'></div>"
-                f"</div>"
-                f"<span style='font-size:11px; color:#7256F6; font-weight:bold; min-width:30px;'>+{w}</span>"
-                f"<span style='font-size:10px; color:#888;'>{f['category']}</span>"
-                f"</div></div>",
-                unsafe_allow_html=True
+    for rtype in ["Patient", "Condition", "ExplanationOfBenefit"]:
+        try:
+            r = requests.get(
+                f"{FHIR_BASE}/{rtype}?_count=1&_summary=count",
+                timeout=15
             )
+            total  = r.json().get("total", "unknown")
+            status = "✓" if isinstance(total, int) and total > 0 else "⚠"
+            log.info(f"  {status}  {rtype:<30} {total:>6} records")
+            if total == 0:
+                all_ok = False
 
-        st.markdown("---")
-        st.markdown("**Human Review Decision**")
-        reviewer = st.text_input("Reviewer ID", placeholder="VA staff ID", key="reviewer_id")
-        notes    = st.text_area("Clinical Notes",
-                        placeholder="Override rationale or escalation reason...",
-                        height=80, key="rev_notes")
+            if rtype == "Patient" and isinstance(total, int) and total > 0:
+                pr      = requests.get(f"{FHIR_BASE}/Patient?_count=1", timeout=15)
+                entries = pr.json().get("entry", [])
+                if entries:
+                    patient_id = entries[0].get("resource", {}).get("id")
 
-        action_col1, action_col2, action_col3 = st.columns(3)
-        with action_col1:
-            if st.button("✅ Approve", use_container_width=True, key="approve_btn"):
-                if reviewer:
-                    st.session_state.claim_statuses[claim["id"]] = "Approved"
-                    st.session_state.audit_log.append({
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "claim":     claim["id"],
-                        "action":    "APPROVED",
-                        "reviewer":  reviewer,
-                        "score":     score,
-                        "notes":     notes or "—"
-                    })
-                    st.session_state.selected_claim = None
-                    st.rerun()
-                else:
-                    st.error("Reviewer ID required")
-        with action_col2:
-            if st.button("✏️ Override", use_container_width=True, key="override_btn"):
-                if reviewer:
-                    st.session_state.claim_statuses[claim["id"]] = "Overridden"
-                    st.session_state.audit_log.append({
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "claim":     claim["id"],
-                        "action":    "OVERRIDE",
-                        "reviewer":  reviewer,
-                        "score":     score,
-                        "notes":     notes or "—"
-                    })
-                    st.session_state.selected_claim = None
-                    st.rerun()
-                else:
-                    st.error("Reviewer ID required")
-        with action_col3:
-            if st.button("🚨 Escalate", use_container_width=True, key="escalate_btn"):
-                if reviewer:
-                    st.session_state.claim_statuses[claim["id"]] = "Escalated"
-                    st.session_state.audit_log.append({
-                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "claim":     claim["id"],
-                        "action":    "ESCALATED",
-                        "reviewer":  reviewer,
-                        "score":     score,
-                        "notes":     notes or "—"
-                    })
-                    st.session_state.selected_claim = None
-                    st.rerun()
-                else:
-                    st.error("Reviewer ID required")
+        except Exception as e:
+            log.warning(f"  ✗  {rtype:<30} verification failed — {e}")
+            all_ok = False
 
+    # Verify patient-condition linkage
+    if patient_id:
+        log.info("-" * 60)
+        log.info(f"Verifying linkage for Patient/{patient_id}...")
+        try:
+            cr         = requests.get(
+                f"{FHIR_BASE}/Condition",
+                params={"patient": patient_id, "_count": 5},
+                timeout=15
+            )
+            cond_count = cr.json().get("total", 0)
+            if isinstance(cond_count, int) and cond_count > 0:
+                log.info(
+                    f"  ✓  Patient/{patient_id} has {cond_count} "
+                    f"linked conditions — referential integrity OK"
+                )
+            else:
+                log.warning(
+                    f"  ⚠  Patient/{patient_id} returned 0 conditions "
+                    f"— referential integrity may be broken"
+                )
+                all_ok = False
+        except Exception as e:
+            log.warning(f"  ✗  Linkage check failed — {e}")
+
+    # Verify EOB has diagnosis codes
+    log.info("Verifying EOB diagnosis injection...")
+    try:
+        er      = requests.get(f"{FHIR_BASE}/ExplanationOfBenefit?_count=1", timeout=15)
+        entries = er.json().get("entry", [])
+        if entries:
+            eob  = entries[0].get("resource", {})
+            dxs  = eob.get("diagnosis", [])
+            if dxs:
+                code = dxs[0].get("diagnosisCodeableConcept", {}).get("coding", [{}])[0].get("code", "")
+                log.info(f"  ✓  EOB has diagnosis codes — primary: {code} — varied risk profiles active")
+            else:
+                log.warning("  ⚠  EOB has no diagnosis codes — denials page may default to LOW RISK")
+    except Exception as e:
+        log.warning(f"  ✗  EOB diagnosis check failed — {e}")
+
+    return all_ok
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+
+    in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+
+    log.info("=" * 60)
+    log.info("Commence VA RCM Demo — Data Loader")
+    log.info(f"Target FHIR server : {FHIR_BASE}")
+    log.info(f"Veteran population : {VETERAN_COUNT} records")
+    log.info(f"Geography          : {CITY}, {STATE} (VISN 18)")
+    log.info(f"Upload method      : Individual POST — patients first")
+    log.info(f"Resource filter    : {', '.join(sorted(UPLOAD_RESOURCE_TYPES))}")
+    log.info(f"EOB cutoff date    : {EOB_CUTOFF_DATE} (last 6 months)")
+    log.info(f"ICD-10 injection   : Enabled — varied denial risk profiles")
+    log.info(f"Reference rewrite  : urn:uuid and Patient/ formats handled")
+    log.info(f"Environment        : {'GitHub Actions CI' if in_ci else 'Local'}")
+    log.info(f"Started            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info("=" * 60)
+
+    # Step 1 — Generate
+    if not in_ci:
+        log.info("Step 1 — Generating Synthea veteran population...")
+        if not generate_synthea_data():
+            log.error("Synthea generation failed — aborting")
+            sys.exit(1)
     else:
-        st.markdown("### 👆 Select a claim to review")
-        st.info("Click **Select** on any claim in the queue to open the explainability panel and take a review action.")
+        log.info("Step 1 — Skipping generation (run by GitHub Actions workflow)")
+        files = list(Path(OUTPUT_PATH).glob("*.json"))
+        log.info(f"         Found {len(files)} pre-generated bundle files")
 
-    # Audit trail
-    if st.session_state.audit_log:
-        st.markdown("---")
-        st.markdown("### 📝 Audit Trail (FISMA)")
-        for entry in reversed(st.session_state.audit_log[-8:]):
-            color = {"APPROVED":"#22C55E","OVERRIDE":"#F59E0B","ESCALATED":"#FF5C6B"}.get(entry["action"],"#7256F6")
-            notes_html = (
-                f"<br><span style='color:#666; font-size:12px;'>Notes: {entry['notes']}</span>"
-                if entry["notes"] != "—" else ""
-            )
-            st.markdown(
-                f"<div class='audit-entry'>"
-                f"<span style='color:{color}; font-weight:bold;'>{entry['action']}</span>"
-                f"&nbsp;·&nbsp; {entry['claim']}"
-                f"&nbsp;·&nbsp; Score {entry['score']}"
-                f"&nbsp;·&nbsp; {entry['reviewer']}"
-                f"&nbsp;·&nbsp; <span style='color:#888;'>{entry['timestamp']}</span>"
-                f"{notes_html}"
-                f"</div>",
-                unsafe_allow_html=True
-            )
+    # Step 2 — Upload
+    log.info("Step 2 — Uploading filtered resources to FHIR server...")
+    success, failed = upload_all_bundles()
 
-# ── Footer ────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption(
-    "Commence · AI Denials Prediction · "
-    f"Data: CMS CARC/RARC · FHIR R4 ({'server.fire.ly — live' if use_live else 'offline synthetic fallback'}) · "
-    "CFR 38 · VA RO/CPAC Industry Day Demo · Sol. 36C10X26Q0085"
-)
+    log.info("-" * 60)
+    log.info(f"Upload complete — {success} bundles succeeded, {failed} failed")
+
+    if failed > 0:
+        log.warning(f"{failed} bundles had failures — check log for details")
+
+    # Step 3 — Verify
+    log.info("Step 3 — Verifying upload and referential integrity...")
+    ok = verify_upload()
+
+    log.info("=" * 60)
+    if ok and failed == 0:
+        log.info("✓ All done — demo data is live with referential integrity confirmed")
+    elif ok:
+        log.info("⚠ Done with some failures — data partially available")
+    else:
+        log.info("✗ Verification failed — check log for details")
+    log.info(f"Log file: {LOG_FILE}")
+    log.info("=" * 60)
+
+    sys.exit(0 if (ok and failed == 0) else 1)
+
+
+if __name__ == "__main__":
+    main()
