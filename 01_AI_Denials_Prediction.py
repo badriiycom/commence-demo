@@ -45,7 +45,31 @@ def fetch_eobs(count=20):
     return None, "offline"
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_patients(count=20):
+def fetch_patient_conditions(pat_id):
+    """
+    Fetch ICD-10 condition codes for a specific patient.
+    Used as fallback when EOB has no diagnosis codes.
+    Returns list of ICD-10 code strings.
+    """
+    try:
+        r = requests.get(
+            f"{FHIR_BASE}/Condition",
+            params={"patient": pat_id, "_count": 10, "_format": "json"},
+            timeout=5
+        )
+        if r.status_code != 200:
+            return []
+        codes = []
+        for entry in r.json().get("entry", []):
+            res = entry.get("resource", {})
+            for coding in res.get("code", {}).get("coding", []):
+                system = coding.get("system", "")
+                code   = coding.get("code", "")
+                if system.startswith("http://hl7.org/fhir/sid/icd") and code:
+                    codes.append(code)
+        return codes
+    except Exception:
+        return []
     """Fetch Patient resources from Firely FHIR"""
     try:
         r = requests.get(
@@ -185,36 +209,44 @@ ICD10_DENIAL_RISK = {
     }
 }
 
-def get_icd10_category(eob):
+def get_icd10_category(eob, patient_conditions=None):
     """
     Extract primary ICD-10 chapter from EOB diagnosis codes.
-    Returns the first character of the primary diagnosis code
-    which maps to ICD-10 chapter (A-Z).
+    Falls back to patient condition codes when EOB has no diagnoses
+    — common with Synthea pre-adjudication EOBs.
+    Returns the first character of the primary ICD-10 code (A-Z).
     """
-    diagnoses = eob.get("diagnosis", [])
-    for dx in diagnoses:
+    # First try EOB diagnosis array
+    for dx in eob.get("diagnosis", []):
         code = (
             dx.get("diagnosisCodeableConcept", {})
               .get("coding", [{}])[0]
               .get("code", "")
         )
-        if code and code[0].isalpha():
+        if code and code[0].isalpha() and code[0].upper() in ICD10_DENIAL_RISK:
             return code[0].upper()
+
+    # Fall back to patient condition codes
+    if patient_conditions:
+        for code in patient_conditions:
+            if code and code[0].isalpha() and code[0].upper() in ICD10_DENIAL_RISK:
+                return code[0].upper()
+
     return None
 
 # ── Denial scoring engine ─────────────────────────────────────────
-def score_claim(eob, patient_data):
+def score_claim(eob, patient_data, patient_conditions=None):
     """
     Score a claim for denial risk using:
 
     1. Real CARC codes from EOB adjudication (when present)
     2. ICD-10 category denial rate patterns from CMS Medicare data
-       (when no CARC codes present — typical for pre-adjudication claims)
+       First tries EOB diagnosis codes, then falls back to patient
+       condition codes fetched separately from FHIR — ensuring
+       meaningful risk categorization for pre-adjudication claims.
 
     This replaces arbitrary hash-based scoring with denial rates
     grounded in CMS Medicare denial pattern data and PEPPER reports.
-    The approach is analogous to the CFR 38 rule-based matching
-    on the SC/SA page — deterministic, precedent-based, not trained ML.
     """
     score   = 0
     factors = []
@@ -246,7 +278,7 @@ def score_claim(eob, patient_data):
 
     # ── Path 2: ICD-10 category denial rates (no CARC codes) ─────
     if not factors:
-        icd_category = get_icd10_category(eob)
+        icd_category = get_icd10_category(eob, patient_conditions)
         risk_profile = ICD10_DENIAL_RISK.get(
             icd_category,
             ICD10_DENIAL_RISK["DEFAULT"]
@@ -438,18 +470,26 @@ else:
 if use_live:
     claims = []
     for i, eob in enumerate(eobs[:18]):
-        score, factors, amount, payer = score_claim(eob, patients)
         eob_id  = eob.get("id", f"EOB-{i:04d}")
         pat_ref = eob.get("patient", {}).get("reference", "")
         pat_id  = pat_ref.split("/")[-1] if pat_ref else ""
         patient = patients.get(pat_id, {})
-        given   = patient.get("name", [{}])[0].get("given",  ["Veteran"])[0] if patient else "Veteran"
-        family  = patient.get("name", [{}])[0].get("family", chr(65+i))      if patient else chr(65+i)
+
+        # Fetch patient conditions for ICD-10 category fallback
+        pat_conditions = fetch_patient_conditions(pat_id) if pat_id else []
+
+        score, factors, amount, payer = score_claim(eob, patients, pat_conditions)
+
+        given  = patient.get("name", [{}])[0].get("given",  ["Veteran"])[0] if patient else "Veteran"
+        family = patient.get("name", [{}])[0].get("family", chr(65+i))      if patient else chr(65+i)
 
         payers_list   = ["Aetna","UnitedHealthcare","TRICARE","VA OHI","Cigna","BCBS","Humana"]
         types_list    = ["Veteran/SC","OHI Patient","TRICARE","Non-Veteran","Dual Eligible"]
         services_list = ["Inpatient","Outpatient","Emergency","Mental Health","Surgery","Radiology"]
         h = sum(ord(c) for c in eob_id)
+
+        # Determine ICD-10 category for caption display
+        icd_cat = get_icd10_category(eob, pat_conditions) or "DEFAULT"
 
         claims.append({
             "id":        f"CLM-{eob_id[-6:].upper()}",
@@ -460,6 +500,7 @@ if use_live:
             "amount":    amount,
             "score":     score,
             "factors":   factors,
+            "icd_cat":   icd_cat,
             "status":    "Pending Review",
             "submitted": (datetime.date.today() - datetime.timedelta(days=(h % 14)+1)).isoformat(),
             "fhir_id":   eob_id
