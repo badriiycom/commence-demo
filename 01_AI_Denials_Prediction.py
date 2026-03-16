@@ -70,6 +70,9 @@ def fetch_patient_conditions(pat_id):
         return codes
     except Exception:
         return []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_patients(count=20):
     """Fetch Patient resources from Firely FHIR"""
     try:
         r = requests.get(
