@@ -533,52 +533,45 @@ with detail_col:
         b_color   = billing["color"]
         b_revenue = pat["total_revenue"]
 
-        # Build review reason row separately to avoid nested f-string issues
+        # Build review reason row separately — avoids nested conditional in HTML
         review_row = ""
         if billing["review_reason"]:
             review_row = (
-                "<tr>"
-                "<td style='color:#666; padding:3px 0;'>Review Reason</td>"
-                f"<td style='font-size:11px; color:#666;'>{billing['review_reason']}</td>"
-                "</tr>"
+                f"<div style='display:flex; justify-content:space-between; padding:3px 0;'>"
+                f"<span style='color:#666; font-size:12px;'>Review Reason</span>"
+                f"<span style='font-size:11px; color:#666;'>{billing['review_reason']}</span>"
+                f"</div>"
             )
 
-        st.markdown(f"""
-        <div style='background:{b_color}11; border:2px solid {b_color};
-                    border-radius:10px; padding:14px 16px; margin:10px 0;'>
-            <div style='display:flex; justify-content:space-between;
-                        align-items:center; margin-bottom:10px;'>
-                <span style='font-size:18px; font-weight:bold;
-                             color:{b_color};'>{billing['status']}</span>
-                <span style='font-size:12px; color:#444;
-                             font-family:monospace;'>{billing['authority']}</span>
-            </div>
-            <table style='width:100%; font-size:12px; border-collapse:collapse;'>
-                <tr>
-                    <td style='color:#666; padding:3px 0; width:45%;'>Veteran Liability</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{billing['copayment']}</td>
-                </tr>
-                <tr>
-                    <td style='color:#666; padding:3px 0;'>Third-party Recovery</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{billing['third_party']}</td>
-                </tr>
-                <tr>
-                    <td style='color:#666; padding:3px 0;'>Est. Revenue</td>
-                    <td style='font-weight:bold; color:{b_color};'>${b_revenue:,}</td>
-                </tr>
-                <tr>
-                    <td style='color:#666; padding:3px 0;'>Human Review</td>
-                    <td style='font-weight:bold; color:#0A2A1A;'>{'Required ⚠️' if billing['human_review'] else 'Not required'}</td>
-                </tr>
-                {review_row}
-            </table>
-            <div style='margin-top:10px; padding:8px; background:{b_color}22;
-                        border-radius:6px; font-size:12px; color:{b_color};
-                        font-weight:bold;'>
-                → {billing['action']}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='background:{b_color}11; border:2px solid {b_color}; border-radius:10px; padding:14px 16px; margin:10px 0;'>"
+            f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>"
+            f"<span style='font-size:18px; font-weight:bold; color:{b_color};'>{billing['status']}</span>"
+            f"<span style='font-size:12px; color:#444; font-family:monospace;'>{billing['authority']}</span>"
+            f"</div>"
+            f"<div style='display:flex; justify-content:space-between; padding:3px 0;'>"
+            f"<span style='color:#666; font-size:12px;'>Veteran Liability</span>"
+            f"<span style='font-weight:bold; color:#0A2A1A; font-size:12px;'>{billing['copayment']}</span>"
+            f"</div>"
+            f"<div style='display:flex; justify-content:space-between; padding:3px 0;'>"
+            f"<span style='color:#666; font-size:12px;'>Third-party Recovery</span>"
+            f"<span style='font-weight:bold; color:#0A2A1A; font-size:12px;'>{billing['third_party']}</span>"
+            f"</div>"
+            f"<div style='display:flex; justify-content:space-between; padding:3px 0;'>"
+            f"<span style='color:#666; font-size:12px;'>Est. Revenue</span>"
+            f"<span style='font-weight:bold; color:{b_color}; font-size:12px;'>${b_revenue:,}</span>"
+            f"</div>"
+            f"<div style='display:flex; justify-content:space-between; padding:3px 0;'>"
+            f"<span style='color:#666; font-size:12px;'>Human Review</span>"
+            f"<span style='font-weight:bold; color:#0A2A1A; font-size:12px;'>{'Required ⚠️' if billing['human_review'] else 'Not required'}</span>"
+            f"</div>"
+            f"{review_row}"
+            f"<div style='margin-top:10px; padding:8px; background:{b_color}22; border-radius:6px; font-size:12px; color:{b_color}; font-weight:bold;'>"
+            f"→ {billing['action']}"
+            f"</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
         # ── Authorize SC Determination ────────────────────────────
         st.markdown("---")
