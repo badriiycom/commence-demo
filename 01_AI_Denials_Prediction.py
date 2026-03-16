@@ -252,9 +252,12 @@ def score_claim(eob, patient_data):
             ICD10_DENIAL_RISK["DEFAULT"]
         )
 
-        # Base score from CMS denial rate for this ICD-10 category
-        # Scale 0-1 rate to 0-100 score with clinical weighting
-        base_score = int(risk_profile["base_risk"] * 100)
+        # Rescale CMS denial rates to meaningful risk tiers
+        # Maps 0.20-0.45 denial rate range to 35-85 score range
+        # So 44% mental health denial rate scores 83 (High Risk)
+        # rather than 44 which incorrectly shows as Low Risk
+        base_score = int(35 + (risk_profile["base_risk"] - 0.20) * (85 - 35) / (0.45 - 0.20))
+        base_score = max(35, min(85, base_score))
 
         # Add claim value modifier
         total_amount = 0
@@ -350,8 +353,10 @@ def synthetic_claims():
         risk    = ICD10_DENIAL_RISK.get(scenario["icd_cat"], ICD10_DENIAL_RISK["DEFAULT"])
         amount  = scenario["amount"]
 
-        # Score from CMS denial rate + value modifier
-        base_score     = int(risk["base_risk"] * 100)
+        # Rescale CMS denial rates to meaningful risk tiers
+        # Same formula as score_claim for consistent behavior
+        base_score     = int(35 + (risk["base_risk"] - 0.20) * (85 - 35) / (0.45 - 0.20))
+        base_score     = max(35, min(85, base_score))
         value_modifier = 12 if amount > 10000 else 7 if amount > 5000 else 0
         score          = min(base_score + value_modifier, 98)
 
