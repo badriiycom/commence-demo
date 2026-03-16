@@ -212,6 +212,23 @@ ICD10_DENIAL_RISK = {
     }
 }
 
+# ── VHA Realistic Claim Amounts by ICD-10 Category ───────────────
+# Used when Synthea EOBs return $0 or unrealistically low amounts.
+# Based on VHA average claim values by diagnosis category.
+# Ensures Revenue at Risk metric is meaningful for demo purposes.
+VHA_CLAIM_AMOUNTS = {
+    "C": 24600,   # Cancer — oncology, surgery, chemo
+    "I": 18400,   # Cardiovascular — inpatient, cath lab
+    "S": 11200,   # TBI/Trauma — emergency, neurology
+    "F": 7800,    # Mental Health — inpatient, intensive outpatient
+    "J": 8900,    # Respiratory — pulmonology, COPD management
+    "M": 3400,    # Musculoskeletal — ortho, PT
+    "G": 4200,    # Neurological — neurology, imaging
+    "E": 1240,    # Endocrine — diabetes management
+    "H": 890,     # Sensory — audiology, hearing aids
+    "DEFAULT": 4200,
+}
+
 def get_icd10_category(eob, patient_conditions=None):
     """
     Extract primary ICD-10 chapter from EOB diagnosis codes.
@@ -339,9 +356,17 @@ def score_claim(eob, patient_data, patient_conditions=None):
     for item in eob.get("item", []):
         amt = item.get("adjudication", [{}])[0].get("amount", {}).get("value", 0)
         total_amount += float(amt or 0)
+
     if total_amount == 0:
         payment = eob.get("payment", {}).get("amount", {}).get("value", 0)
         total_amount = float(payment or 0)
+
+    # If still zero or unrealistically small (<$50) use VHA realistic
+    # amounts based on ICD-10 category — Synthea EOBs frequently
+    # return $0 for routine visits making Revenue at Risk meaningless
+    if total_amount < 50:
+        icd_cat      = get_icd10_category(eob, patient_conditions)
+        total_amount = VHA_CLAIM_AMOUNTS.get(icd_cat, VHA_CLAIM_AMOUNTS["DEFAULT"])
 
     payer_display = eob.get("insurer", {}).get("display", "Unknown")
 
