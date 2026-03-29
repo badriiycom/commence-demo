@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # ── Load reference data ───────────────────────────────────────────
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent / "data"
 
 @st.cache_data
 def load_carc():
